@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="refresh" content="30">
+    <title>Cognito Agent Dashboard</title>
+    <style>
+        body { font-family: sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 2em; }
+        .container { max-width: 900px; margin: auto; }
+        h1, h2 { color: #bb86fc; border-bottom: 1px solid #333; padding-bottom: 0.5em; }
+        .nav { margin-bottom: 2em; }
+        .nav a { color: #03dac6; text-decoration: none; margin-right: 1em; }
+        .goal { background-color: #1e1e1e; border-left: 5px solid #444; margin-bottom: 1em; padding: 1em; border-radius: 8px; }
+        .goal.status-complete { border-left-color: #03dac6; }
+        .goal.status-in-progress { border-left-color: #f0e68c; }
+        .goal.status-failed { border-left-color: #cf6679; }
+        .goal.status-awaiting-input { border-left-color: #3b82f6; } /* Blue for waiting */
+        h3 { margin-top: 0; cursor: pointer; }
+        .details { margin-top: 1em; padding-left: 1em; border-left: 1px solid #444; }
+        .step { margin-bottom: 1em; }
+        pre { background-color: #272727; padding: 0.5em; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; font-family: monospace; }
+        .add-goal-form { margin-bottom: 2em; }
+        .add-goal-form input, .user-input-form textarea { width: 70%; padding: 0.8em; border-radius: 4px; border: 1px solid #333; background-color: #222; color: #eee; }
+        .add-goal-form button, .user-input-form button { width: 25%; padding: 0.8em; border-radius: 4px; border: none; background-color: #bb86fc; color: #121212; cursor: pointer; }
+        .user-input-form { margin-top: 1em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Cognito Agent Dashboard</h1>
+        <div class="nav">
+            <a href="/summary" target="_blank">View Today's Summary</a>
+            <a href="/log" target="_blank">View Live Log</a>
+        </div>
+        <div class="add-goal-form">
+            <form action="/add_goal" method="post">
+                <input type="text" name="goal_text" placeholder="Enter a new high-level goal..." required>
+                <button type="submit">Add Goal</button>
+            </form>
+        </div>
+
+        <h2>Active Goals</h2>
+        {% for goal in active_goals %}
+            <div class="goal status-{{ goal.status.replace('_', '-') }}">
+                <details open>
+                    <summary><h3>{{ goal.goal }} ({{ goal.status }})</h3></summary>
+                    <div class="details">
+                        {% for step in goal.plan %}
+                        <div class="step">
+                            <strong>Step {{ step.get('step_id', 'N/A') }} ({{ step.status }}):</strong>
+                            {% if 'tool_call' in step and step.tool_call %}
+                                <p>Tool: <code>{{ step.tool_call.get('tool_name', 'Unknown Tool') }}</code></p>
+                                <p>Parameters: <pre>{{ step.tool_call.get('parameters', {}) | tojson(indent=2) }}</pre></p>
+                                {% if goal.status == 'awaiting_input' and step.status == 'pending' %}
+                                    <div class="user-input-form">
+                                        <form action="/provide_input" method="post">
+                                            <input type="hidden" name="goal_id" value="{{ goal.goal_id }}">
+                                            <input type="hidden" name="step_id" value="{{ step.step_id }}">
+                                            <textarea name="user_response" rows="3" placeholder="Provide your answer here..."></textarea>
+                                            <button type="submit">Submit Input</button>
+                                        </form>
+                                    </div>
+                                {% endif %}
+                            {% elif 'prompt' in step %}
+                                <p>Prompt:</p> <pre>{{ step.prompt }}</pre>
+                            {% else %}
+                                <p>Invalid Step Format:</p> <pre>{{ step | tojson(indent=2) }}</pre>
+                            {% endif %}
+                            {% if step.output %}
+                                <p>Output:</p> <pre>{{ step.output }}</pre>
+                            {% endif %}
+                        </div>
+                        {% endfor %}
+                    </div>
+                </details>
+            </div>
+        {% else %}
+            <div class="goal"><p>No active goals.</p></div>
+        {% endfor %}
+
+        <h2>Archived Goals (Last 20)</h2>
+        {% for goal in archived_goals %}
+            <div class="goal status-{{ goal.status }}">
+                <details>
+                    <summary><h3>{{ goal.goal }} ({{ goal.status }})</h3></summary>
+                    <div class="details">
+                        {% for step in goal.plan %}
+                        <div class="step">
+                            <strong>Step {{ step.get('step_id', 'N/A') }} ({{ step.status }}):</strong>
+                            {% if 'tool_call' in step and step.tool_call %}
+                                <p>Tool: <code>{{ step.tool_call.get('tool_name', 'Unknown Tool') }}</code></p>
+                            {% elif 'prompt' in step %}
+                                <p>Prompt:</p> <pre>{{ step.prompt }}</pre>
+                            {% else %}
+                                <p>Invalid Step Format:</p> <pre>{{ step | tojson(indent=2) }}</pre>
+                            {% endif %}
+                            {% if step.output %}
+                                <p>Output:</p> <pre>{{ step.output }}</pre>
+                            {% endif %}
+                        </div>
+                        {% endfor %}
+                    </div>
+                </details>
+            </div>
+        {% else %}
+            <div class="goal"><p>No archived goals found.</p></div>
+        {% endfor %}
+    </div>
+</body>
+</html>
