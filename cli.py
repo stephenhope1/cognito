@@ -1,5 +1,6 @@
 import click
 import uuid
+import datetime
 from core.context import logger
 from utils.database import add_goal, get_active_goals, initialize_database
 from core.planner import orchestrate_planning
@@ -20,7 +21,8 @@ def add(goal_text: str):
 
     if new_goal_obj:
         # Add the final unique ID and source before saving
-        new_goal_obj['goal_id'] = f"cli_{'clarification' if new_goal_obj['status'] == 'awaiting_input' else 'goal'}_{uuid.uuid4()}"
+        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        new_goal_obj['goal_id'] = f"cli_{'clarification' if new_goal_obj['status'] == 'awaiting_input' else 'goal'}_{timestamp_str}"
         add_goal(new_goal_obj)
         click.echo(f"✅ Successfully created and added new goal '{new_goal_obj['goal_id']}' to the database.")
         if new_goal_obj['status'] == 'awaiting_input':

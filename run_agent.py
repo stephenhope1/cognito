@@ -2,85 +2,53 @@ import threading
 import multiprocessing
 import time
 import uuid
-from logs.logger import logger
+from utils.logger import logger
 
 # Import the main functions/apps
 from main import main as run_orchestrator
-from dashboard import app as dashboard_app
+from dashboard import app as dashboard_app, socketio, watch_status_queue # MODIFIED
 from core.file_watcher import main as run_file_watcher
 from voice_interface import main as run_voice_interface
 
-# Import the necessary components for the new planning pipeline
-from core.context import gemini_client
-from core.strategist import run_strategist
-from core.planner import generate_plan
+# Import the necessary components for the planning pipeline
+from core.planner import orchestrate_planning
 from utils.database import add_goal
 
 def run_dashboard():
-    """Starts the Flask web server in a separate thread."""
-    logger.info("Starting dashboard thread...")
-    dashboard_app.run(host='0.0.0.0', port=5000, debug=False)
+    """Starts the Flask-SocketIO web server."""
+    logger.info("Starting dashboard thread with WebSocket server...")
+    # MODIFIED: Use socketio.run() to correctly start the server
+    socketio.run(dashboard_app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
+
+def _create_and_add_goal(goal_text: str, source: str):
+    """
+    Calls the planning orchestrator and adds the resulting goal to the database.
+    """
+    new_goal_obj = orchestrate_planning(goal_text)
+    
+    if new_goal_obj:
+        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        new_goal_obj['goal_id'] = f"cli_{'clarification' if new_goal_obj['status'] == 'awaiting_input' else 'goal'}_{timestamp_str}"
+        add_goal(new_goal_obj)
+        logger.info(f"Successfully created and added new goal '{new_goal_obj['goal_id']}' to database.")
+
+    else:
+        logger.error(f"Failed to create a plan for the goal: '{goal_text}'")
 
 def voice_command_listener(queue):
     """A thread that listens for transcribed voice commands and orchestrates planning."""
     logger.info("Voice command listener thread started.")
     while True:
         try:
-            # This will block until a command is received from the voice process
             goal_text = queue.get()
-            
             logger.info(f"VOICE QUEUE: Received goal: '{goal_text}'")
-            
-            # --- NEW TWO-STAGE PLANNING LOGIC ---
-
-            # 1. Run the Strategist to get the blueprint
-            strategy_blueprint = run_strategist(goal_text)
-            if not strategy_blueprint:
-                logger.error("VOICE QUEUE: Strategist failed to generate a blueprint.")
-                continue # Wait for the next command
-
-            # 2. Check if the Strategist requires user clarification
-            if strategy_blueprint.get("requires_clarification"):
-                logger.info("VOICE QUEUE: Strategy requires user input. Pausing goal.")
-                clarification_plan = [{
-                    "step_id": 1,
-                    "dependencies": [],
-                    "tool_call": {
-                        "tool_name": "request_user_input",
-                        "parameters": {"question": strategy_blueprint.get("clarification_question")}
-                    },
-                    "status": "pending", "output": None
-                }]
-                new_goal = {
-                    "goal_id": f"voice_clarification_{uuid.uuid4()}", "goal": goal_text,
-                    "plan": clarification_plan,
-                    "audit_critique": "Awaiting user clarification before full planning.",
-                    "status": "awaiting_input",
-                    "strategy_blueprint": strategy_blueprint
-                }
-            else:
-                # 3. If no clarification is needed, run the Planner
-                final_plan = generate_plan(goal_text, strategy_blueprint, gemini_client)
-                if not final_plan:
-                    logger.error("VOICE QUEUE: Planner failed to generate a plan from the blueprint.")
-                    continue # Wait for the next command
-
-                new_goal = {
-                    "goal_id": f"voice_goal_{uuid.uuid4()}", "goal": goal_text,
-                    "plan": [{**step, "status": "pending", "output": None} for step in final_plan],
-                    "audit_critique": f"Plan generated using '{strategy_blueprint.get('cognitive_gear')}' gear.",
-                    "status": "pending",
-                    "strategy_blueprint": strategy_blueprint
-                }
-
-            add_goal(new_goal)
-            logger.info(f"VOICE QUEUE: Successfully created and added new goal '{new_goal['goal_id']}' to the database.")
-
+            _create_and_add_goal(goal_text, source="voice")
         except Exception as e:
             logger.error(f"Error in voice command listener: {e}")
 
 if __name__ == "__main__":
     from utils.database import initialize_database
+    from dashboard import get_full_status_data # Import helper for _create_and_add_goal
     initialize_database()
 
     logger.info("--- LAUNCHING COGNITO AGENT ---")
@@ -92,7 +60,8 @@ if __name__ == "__main__":
         "File_Watcher": {"target": run_file_watcher, "type": "thread"},
         "Dashboard": {"target": run_dashboard, "type": "thread"},
         "Voice_Command_Listener": {"target": voice_command_listener, "args": (command_queue,), "type": "thread"},
-        "Voice_Interface": {"target": run_voice_interface, "args": (command_queue,), "type": "process"}
+        "Voice_Interface": {"target": run_voice_interface, "args": (command_queue,), "type": "process"},
+        "Status_Queue_Watcher": {"target": watch_status_queue, "type": "thread"} # MODIFIED: Add the new watcher
     }
     
     processes_and_threads = []

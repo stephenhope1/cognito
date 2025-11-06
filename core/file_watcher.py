@@ -7,6 +7,7 @@ from core.context import logger
 from utils.database import add_goal
 from core.planner import orchestrate_planning
 
+
 # --- Configuration ---
 WATCH_PATH = 'data/inbox'
 

@@ -1,8 +1,7 @@
 import chromadb
-import google.generativeai as genai
 import os
 from dotenv import load_dotenv
-from logs.logger import logger
+from utils.logger import logger
 
 class MemoryManager:
     """Handles the agent's memory operations using ChromaDB and Gemini embeddings."""

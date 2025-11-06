@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Full Agent Log</title>
+    <style>
+        body { font-family: monospace; background-color: #121212; color: #e0e0e0; margin: 0; padding: 2em; }
+        .container { max-width: 1200px; margin: auto; }
+        h1 { color: #bb86fc; font-family: sans-serif; }
+        .log-content { background-color: #1e1e1e; padding: 1em; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; max-height: 80vh; overflow-y: auto; }
+        .search-form { margin: 1em 0; }
+        .search-form input { padding: 0.5em; width: 300px; background-color: #222; border: 1px solid #333; color: #eee; }
+        .search-form button { padding: 0.5em 1em; background-color: #bb86fc; border: none; color: #121212; cursor: pointer; }
+        .back-link { display: inline-block; margin-bottom: 1em; color: #03dac6; font-family: sans-serif; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Full Agent Log</h1>
+        <a href="/" class="back-link">&larr; Back to Live Dashboard</a>
+        <div class="search-form">
+            <form method="get">
+                <input type="text" name="q" placeholder="Search log..." value="{{ search_query }}">
+                <button type="submit">Search</button>
+            </form>
+        </div>
+        <div class="log-content" id="log-container">
+            {{ log_content|safe }}
+        </div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const socket = io();
+            const logContainer = document.getElementById('log-container');
+
+            socket.on('connect', () => {
+                console.log('Connected to agent for live log updates.');
+            });
+
+            // Listen for the 'new_log_line' event
+            socket.on('new_log_line', (msg) => {
+                // Create a new text node and a line break
+                const newLine = document.createTextNode(msg.data + '\\n');
+                
+                // Prepend the new line to the top of the log container
+                logContainer.insertBefore(document.createElement('br'), logContainer.firstChild);
+                logContainer.insertBefore(newLine, logContainer.firstChild);
+            });
+
+            socket.on('disconnect', () => {
+                console.log('Disconnected from agent.');
+            });
+        });
+    </script>
+</body>
+</html>

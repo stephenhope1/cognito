@@ -3,109 +3,293 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="refresh" content="30">
     <title>Cognito Agent Dashboard</title>
     <style>
-        body { font-family: sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 2em; }
-        .container { max-width: 900px; margin: auto; }
-        h1, h2 { color: #bb86fc; border-bottom: 1px solid #333; padding-bottom: 0.5em; }
-        .nav { margin-bottom: 2em; }
-        .nav a { color: #03dac6; text-decoration: none; margin-right: 1em; }
-        .goal { background-color: #1e1e1e; border-left: 5px solid #444; margin-bottom: 1em; padding: 1em; border-radius: 8px; }
-        .goal.status-complete { border-left-color: #03dac6; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 2em; }
+        .container { max-width: 1200px; margin: auto; }
+        h1 { font-size: 2.5em; color: #bb86fc; }
+        h2 { color: #bb86fc; border-bottom: 1px solid #333; padding-bottom: 0.5em; margin-top: 1.5em; }
+        .dashboard-grid { display: flex; flex-wrap: wrap; gap: 2em; }
+        .main-column { flex: 2; min-width: 300px; }
+        .side-column { flex: 1; min-width: 300px; }
+        .side-box { background-color: #1e1e1e; padding: 1.5em; border-radius: 8px; margin-bottom: 2em; }
+        .side-box h2 { margin-top: 0; }
+        .side-box a { color: #bb86fc; text-decoration: none; }
+        pre { background-color: #272727; padding: 1em; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; font-family: monospace; max-height: 250px; overflow-y: auto; }
+        .goal { background-color: #1e1e1e; border-left: 5px solid #444; margin-bottom: 1em; padding: 1.5em; border-radius: 8px; }
+        .goal.status-complete, .goal.status-cancelled { border-left-color: #03dac6; }
         .goal.status-in-progress { border-left-color: #f0e68c; }
         .goal.status-failed { border-left-color: #cf6679; }
-        .goal.status-awaiting-input { border-left-color: #3b82f6; } /* Blue for waiting */
+        .goal.status-awaiting-input, .goal.status-paused, .goal.status-awaiting-tier-decision { border-left-color: #3b82f6; } /* Added new status */
         h3 { margin-top: 0; cursor: pointer; }
-        .details { margin-top: 1em; padding-left: 1em; border-left: 1px solid #444; }
-        .step { margin-bottom: 1em; }
-        pre { background-color: #272727; padding: 0.5em; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; font-family: monospace; }
-        .add-goal-form { margin-bottom: 2em; }
-        .add-goal-form input, .user-input-form textarea { width: 70%; padding: 0.8em; border-radius: 4px; border: 1px solid #333; background-color: #222; color: #eee; }
-        .add-goal-form button, .user-input-form button { width: 25%; padding: 0.8em; border-radius: 4px; border: none; background-color: #bb86fc; color: #121212; cursor: pointer; }
+        .details { margin-top: 1.5em; padding-left: 1.5em; border-left: 1px solid #444; }
+        .step { margin-bottom: 1.5em; }
+        .add-goal-form { margin-bottom: 2em; display: flex; gap: 1em; }
+        .add-goal-form input, .user-input-form textarea { width: 100%; padding: 1em; border-radius: 4px; border: 1px solid #333; background-color: #222; color: #eee; font-size: 1em; }
+        .add-goal-form button, .user-input-form button, .goal-actions button { padding: 1em 1.5em; border-radius: 4px; border: none; background-color: #bb86fc; color: #121212; font-size: 1em; font-weight: bold; cursor: pointer; }
         .user-input-form { margin-top: 1em; }
+        .goal-actions { margin-top: 1em; display: flex; gap: 0.5em; }
+        .goal-actions button { font-size: 0.8em; padding: 0.5em 1em; background-color: #373737; color: #eee; }
+        .goal-actions button.cancel { background-color: #cf6679; color: #121212; }
+        .goal-status-message { font-style: italic; color: #f0e68c; margin-bottom: 0.5em; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Cognito Agent Dashboard</h1>
-        <div class="nav">
-            <a href="/summary" target="_blank">View Today's Summary</a>
-            <a href="/log" target="_blank">View Live Log</a>
-        </div>
+        
         <div class="add-goal-form">
-            <form action="/add_goal" method="post">
+            <form action="/add_goal" method="post" style="width: 100%; display: flex; gap: 1em;">
                 <input type="text" name="goal_text" placeholder="Enter a new high-level goal..." required>
                 <button type="submit">Add Goal</button>
             </form>
         </div>
 
-        <h2>Active Goals</h2>
-        {% for goal in active_goals %}
-            <div class="goal status-{{ goal.status.replace('_', '-') }}">
-                <details open>
-                    <summary><h3>{{ goal.goal }} ({{ goal.status }})</h3></summary>
-                    <div class="details">
-                        {% for step in goal.plan %}
-                        <div class="step">
-                            <strong>Step {{ step.get('step_id', 'N/A') }} ({{ step.status }}):</strong>
-                            {% if 'tool_call' in step and step.tool_call %}
-                                <p>Tool: <code>{{ step.tool_call.get('tool_name', 'Unknown Tool') }}</code></p>
-                                <p>Parameters: <pre>{{ step.tool_call.get('parameters', {}) | tojson(indent=2) }}</pre></p>
-                                {% if goal.status == 'awaiting_input' and step.status == 'pending' %}
-                                    <div class="user-input-form">
-                                        <form action="/provide_input" method="post">
-                                            <input type="hidden" name="goal_id" value="{{ goal.goal_id }}">
-                                            <input type="hidden" name="step_id" value="{{ step.step_id }}">
-                                            <textarea name="user_response" rows="3" placeholder="Provide your answer here..."></textarea>
-                                            <button type="submit">Submit Input</button>
-                                        </form>
-                                    </div>
-                                {% endif %}
-                            {% elif 'prompt' in step %}
-                                <p>Prompt:</p> <pre>{{ step.prompt }}</pre>
-                            {% else %}
-                                <p>Invalid Step Format:</p> <pre>{{ step | tojson(indent=2) }}</pre>
-                            {% endif %}
-                            {% if step.output %}
-                                <p>Output:</p> <pre>{{ step.output }}</pre>
-                            {% endif %}
-                        </div>
-                        {% endfor %}
-                    </div>
-                </details>
+        <div class="dashboard-grid">
+            <div class="main-column">
+                <div id="goals-content">
+                    <h2>Active Goals</h2>
+                    <div class="goal"><p>Connecting...</p></div>
+                    <h2><a href="/archive" target="_blank" style="color: #bb86fc; text-decoration: none;">Archived Goals (Preview)</a></h2>
+                    <div class="goal"><p>Connecting...</p></div>
+                </div>
             </div>
-        {% else %}
-            <div class="goal"><p>No active goals.</p></div>
-        {% endfor %}
-
-        <h2>Archived Goals (Last 20)</h2>
-        {% for goal in archived_goals %}
-            <div class="goal status-{{ goal.status }}">
-                <details>
-                    <summary><h3>{{ goal.goal }} ({{ goal.status }})</h3></summary>
-                    <div class="details">
-                        {% for step in goal.plan %}
-                        <div class="step">
-                            <strong>Step {{ step.get('step_id', 'N/A') }} ({{ step.status }}):</strong>
-                            {% if 'tool_call' in step and step.tool_call %}
-                                <p>Tool: <code>{{ step.tool_call.get('tool_name', 'Unknown Tool') }}</code></p>
-                            {% elif 'prompt' in step %}
-                                <p>Prompt:</p> <pre>{{ step.prompt }}</pre>
-                            {% else %}
-                                <p>Invalid Step Format:</p> <pre>{{ step | tojson(indent=2) }}</pre>
-                            {% endif %}
-                            {% if step.output %}
-                                <p>Output:</p> <pre>{{ step.output }}</pre>
-                            {% endif %}
-                        </div>
-                        {% endfor %}
+            <div class="side-column">
+                <div class="side-box">
+                    <h2 style="margin-top: 0;">Proactive Agent</h2>
+                    <div class="goal-actions">
+                        <button id="dmn-trigger-button" onclick="triggerDMN()">
+                            Brainstorm New Goal
+                        </button>
                     </div>
-                </details>
+                    <p id="dmn-status-text" style="font-size: 0.9em; color: #888; margin-top: 1em; display: none;"></p>
+                </div>
+                <div class="side-box">
+                    <h2><a href="/summaries" target="_blank" style="color: #bb86fc; text-decoration: none;">Today's Summary</a></h2>
+                    <pre id="summary-content">Connecting...</pre>
+                </div>
+                <div class="side-box">
+                    <h2><a href="/logs" target="_blank" style="color: #bb86fc; text-decoration: none;">Live Log (Tail)</a></h2>
+                    <pre id="log-content">Connecting...</pre>
+                </div>
             </div>
-        {% else %}
-            <div class="goal"><p>No archived goals found.</p></div>
-        {% endfor %}
+        </div>
     </div>
+
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <script>
+        async function setGoalStatus(goalId, newStatus) {
+            try {
+                await fetch(`/api/goal/${goalId}/set_status`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ status: newStatus })
+                });
+            } catch (error) {
+                console.error('Error updating goal status:', error);
+            }
+        }
+
+        // --- NEW FUNCTION ADDED ---
+        async function setTier(goalId, newTier) {
+            try {
+                await fetch(`/api/goal/${goalId}/set_tier`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tier: newTier })
+                });
+            } catch (error) {
+                console.error('Error setting goal tier:', error);
+            }
+        }
+        
+        // --- END NEW FUNCTION ---
+        // --- NEW FUNCTION ADDED ---
+        async function triggerDMN() {
+            const button = document.getElementById('dmn-trigger-button');
+            const statusText = document.getElementById('dmn-status-text');
+
+            button.disabled = true;
+            button.textContent = "Brainstorming...";
+            statusText.textContent = "Asking the agent to brainstorm a new goal. This may take a moment...";
+            statusText.style.display = 'block';
+            
+            try {
+                await fetch('/api/trigger_dmn', { method: 'POST' });
+                // The backend will trigger a 'status_update' when the
+                // DMN is done, so we don't need to do anything else.
+                // We'll just reset the button after a short delay.
+                setTimeout(() => {
+                    button.disabled = false;
+                    button.textContent = "Brainstorm New Goal";
+                    statusText.style.display = 'none';
+                }, 2000); // Reset button after 2 seconds
+            } catch (error) {
+                console.error('Error triggering DMN:', error);
+                button.disabled = false;
+                button.textContent = "Error! Try Again";
+                statusText.textContent = "An error occurred.";
+            }
+        }
+        // --- END NEW FUNCTION ---
+
+        function renderStep(step, goalId, goalStatus) {
+            let stepHtml = `<strong>Step ${step.step_id || 'N/A'} (${step.status}):</strong>`;
+            
+            // --- NEW: Add refined_prompt logic for BOTH tool_call and prompt ---
+            if (step.refined_prompt) {
+                stepHtml += `<p>Refined Executor Prompt:</p><pre>${step.refined_prompt}</pre>`;
+            }
+            // --- END NEW ---
+
+            if (step.tool_call) {
+                // Add a check to avoid showing the original prompt if it's already been refined
+                if (!step.refined_prompt) {
+                     stepHtml += `<p>Tool: <code>${step.tool_call.tool_name || 'Unknown Tool'}</code></p>`;
+                }
+                let paramsText = step.tool_call.parameters;
+                if (typeof paramsText === 'string') {
+                    try {
+                        paramsText = JSON.stringify(JSON.parse(paramsText), null, 2);
+                    } catch (e) { /* leave as is */ }
+                } else if (typeof paramsText === 'object') {
+                    paramsText = JSON.stringify(paramsText, null, 2);
+                }
+                stepHtml += `<p>Parameters: <pre>${paramsText || '{}'}</pre></p>`;
+
+                if (goalStatus === 'awaiting_input' && step.status === 'pending' && step.tool_call.tool_name === 'request_user_input') {
+                    stepHtml += `
+                        <div class="user-input-form">
+                            <form action="/provide_input" method="post">
+                                <input type="hidden" name="goal_id" value="${goalId}">
+                                <input type="hidden" name="step_id" value="${step.step_id}">
+                                <textarea name="user_response" rows="3" placeholder="Provide your answer here..."></textarea>
+                                <button type="submit">Submit Input</button>
+                            </form>
+                        </div>
+                    `;
+                }
+            } else if (step.prompt) {
+                stepHtml += `<p>Prompt:</p><pre>${step.prompt}</pre>`;
+                if (step.refined_prompt && step.refined_prompt !== step.prompt) {
+                    stepHtml += `<p>Refined Executor Prompt:</p><pre>${step.refined_prompt}</pre>`;
+                }    
+            } else {
+                stepHtml += `<p>Invalid Step Format:</p><pre>${JSON.stringify(step, null, 2)}</pre>`;
+            }
+            if (step.output) {
+                stepHtml += `<p>Output:</p><pre>${step.output}</pre>`;
+            }
+            return `<div class="step">${stepHtml}</div>`;
+        }
+
+        function renderGoal(goal, is_active=true) {
+            let planDetails = '';
+            if (goal.plan && Array.isArray(goal.plan)) {
+                goal.plan.forEach(step => {
+                    planDetails += renderStep(step, goal.goal_id, goal.status);
+                });
+            }
+            let executionLogHtml = '';
+            if (goal.execution_log) {
+                executionLogHtml = `
+                    <div class="step">
+                        <strong>Execution Log:</strong>
+                        <pre>${goal.execution_log}</pre>
+                    </div>
+                `;
+            }
+
+            // --- LOGIC MODIFIED ---
+            let actionsHtml = '';
+            if (is_active) {
+                actionsHtml += '<div class="goal-actions">';
+                
+                if (goal.status === 'awaiting_tier_decision') {
+                    actionsHtml += `
+                        <div class="goal-status-message">
+                            Tier 1 limit reached. What would you like to do?
+                        </div>
+                        <button onclick="setGoalStatus('${goal.goal_id}', 'pending')">
+                            Wait for Reset
+                        </button>
+                        <button onclick="setTier('${goal.goal_id}', 'tier2')">
+                            Downgrade to Tier 2
+                        </button>
+                    `;
+                } else if (goal.status === 'in-progress' || goal.status === 'pending') {
+                    actionsHtml += `<button onclick="setGoalStatus('${goal.goal_id}', 'paused')">Pause</button>`;
+                } else if (goal.status === 'paused' || goal.status === 'awaiting_input') {
+                    actionsHtml += `<button onclick="setGoalStatus('${goal.goal_id}', 'pending')">Resume</button>`;
+                }
+                
+                // Cancel button is always shown for active goals
+                actionsHtml += `<button class="cancel" onclick="setGoalStatus('${goal.goal_id}', 'cancelled')">Cancel</button>`;
+                actionsHtml += '</div>';
+            }
+            // --- END MODIFIED LOGIC ---
+
+            return `
+                <div class="goal status-${goal.status}" id="goal-${goal.goal_id}">
+                    <details id="details-${goal.goal_id}">
+                        <summary><h3>[${goal.status.toUpperCase()}] ${goal.goal}</h3></summary>
+                        <div class="details">
+                            ${planDetails}
+                            ${executionLogHtml}
+                            ${actionsHtml}
+                        </div>
+                    </details>
+                </div>
+            `;
+        }
+        
+        function updateFullDashboard(data) {
+            const openDetails = new Set();
+            document.querySelectorAll('details[open]').forEach(el => openDetails.add(el.id));
+
+            let activeHtml = '<h2>Active Goals</h2>';
+            if (data.active_goals && data.active_goals.length > 0) {
+                data.active_goals.forEach(goal => activeHtml += renderGoal(goal, true));
+            } else { activeHtml += '<div class="goal"><p>No active goals.</p></div>'; }
+
+            let archivedHtml = '<h2><a href="/archive" target="_blank">Archived Goals (Preview)</a></h2>';
+            if (data.archived_goals && data.archived_goals.length > 0) {
+                data.archived_goals.forEach(goal => archivedHtml += renderGoal(goal, false));
+            } else { archivedHtml += '<div class="goal"><p>No archived goals found.</p></div>'; }
+            
+            document.getElementById('goals-content').innerHTML = activeHtml + archivedHtml;
+            document.getElementById('summary-content').textContent = data.summary_content || 'No summary available.';
+            document.getElementById('log-content').textContent = data.log_tail || 'Log is empty.';
+            
+            openDetails.forEach(id => {
+                const element = document.getElementById(id);
+                if (element) element.open = true;
+            });
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const socket = io();
+            const logContainer = document.getElementById('log-content');
+            const MAX_LOG_LINES = 20;
+
+            socket.on('connect', () => { console.log('Connected to agent via WebSocket!'); });
+            socket.on('disconnect', () => { console.log('Disconnected from agent.'); });
+
+            socket.on('status_update', (data) => {
+                console.log('Received full status update from agent.');
+                updateFullDashboard(data);
+            });
+
+            socket.on('new_log_line', (msg) => {
+                let currentText = logContainer.textContent;
+                let newText = msg.data + '\n' + currentText;
+                let lines = newText.split('\n');
+                if (lines.length > MAX_LOG_LINES) {
+                    lines = lines.slice(0, MAX_LOG_LINES);
+                }
+                logContainer.textContent = lines.join('\n');
+            });
+        });
+    </script>
 </body>
 </html>

@@ -1,8 +1,9 @@
 import time
 import json
 import os
+import threading
 from datetime import datetime
-from logs.logger import logger
+from .logger import logger
 
 STATE_FILE_PATH = 'data/ratelimit_state.json'
 
@@ -11,10 +12,11 @@ class RateLimitTracker:
 
     def __init__(self):
         self.limits = {
-            'tier1': {'rpm': 5, 'rpd': 100},
+            'tier1': {'rpm': 2, 'rpd': 50},
             'tier2': {'rpm': 10, 'rpd': 250},
             'tier3': {'rpm': 15, 'rpd': 1000},
         }
+        self.lock = threading.Lock()
         self._load_state() # MODIFIED: Load state on initialization
 
     def _load_state(self):
@@ -54,52 +56,53 @@ class RateLimitTracker:
 
     def check_and_increment(self, tier: str) -> bool:
         """
-        Checks if a call can be made. If so, increments counters, saves state, and returns True.
+        Thread-safely checks if a call can be made.
         """
-        if tier not in self.limits:
-            logger.error(f"Error: Tier '{tier}' is not a valid tier.")
-            return False
+        with self.lock: # NEW: The "turnstile" - only one thread can be in here at a time
+            if tier not in self.limits:
+                logger.error(f"Error: Tier '{tier}' is not a valid tier.")
+                return False
 
-        self._reset_if_new_day()
-        
-        current_time = time.time()
-        
-        # RPD Check
-        if self.daily_counts[tier] >= self.limits[tier]['rpd']:
-            logger.warning(f"RATE LIMIT: Daily limit reached for {tier}.")
-            return False
-
-        # RPM Check
-        self.call_timestamps[tier] = [ts for ts in self.call_timestamps[tier] if current_time - ts < 60]
-        if len(self.call_timestamps[tier]) >= self.limits[tier]['rpm']:
-            logger.warning(f"RATE LIMIT: Minute limit reached for {tier}.")
-            return False
+            self._reset_if_new_day()
             
-        # All checks passed, increment and allow the call
-        self.call_timestamps[tier].append(current_time)
-        self.daily_counts[tier] += 1
-        
-        logger.info(f"Call allowed for {tier}. "
-                    f"RPM: {len(self.call_timestamps[tier])}/{self.limits[tier]['rpm']}, "
-                    f"RPD: {self.daily_counts[tier]}/{self.limits[tier]['rpd']}")
-        
-        self._save_state() # MODIFIED: Save state after every successful call
-        return True
+            current_time = time.time()
+            
+            # RPD Check
+            if self.daily_counts[tier] >= self.limits[tier]['rpd']:
+                logger.warning(f"RATE LIMIT: Daily limit reached for {tier}.")
+                return False
+
+            # RPM Check
+            self.call_timestamps[tier] = [ts for ts in self.call_timestamps[tier] if current_time - ts < 60]
+            if len(self.call_timestamps[tier]) >= self.limits[tier]['rpm']:
+                logger.warning(f"RATE LIMIT: Minute limit reached for {tier}.")
+                return False
+                
+            # All checks passed, increment and save
+            self.call_timestamps[tier].append(current_time)
+            self.daily_counts[tier] += 1
+            
+            logger.info(f"Call allowed for {tier}. "
+                        f"RPM: {len(self.call_timestamps[tier])}/{self.limits[tier]['rpm']}, "
+                        f"RPD: {self.daily_counts[tier]}/{self.limits[tier]['rpd']}")
+            
+            self._save_state()
+            return True
 
 
     def get_daily_usage_percentage(self, tier: str) -> float:
         """Calculates the current daily usage percentage for a given tier."""
-        if tier not in self.limits:
-            return 0.0
-        
-        self._reset_if_new_day()
-        
-        limit = self.limits[tier]['rpd']
-        if limit == 0:
-            return 100.0 # Avoid division by zero
-        
-        return (self.daily_counts[tier] / limit) * 100
-
+        with self.lock: # NEW: Also protect this read operation for consistency
+            if tier not in self.limits:
+                return 0.0
+            
+            self._reset_if_new_day()
+            
+            limit = self.limits[tier]['rpd']
+            if limit == 0:
+                return 100.0 # Avoid division by zero
+            
+            return (self.daily_counts[tier] / limit) * 100
 
 if __name__ == '__main__':
     logger.info("--- Testing RateLimitTracker ---")

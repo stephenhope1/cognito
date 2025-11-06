@@ -46,13 +46,13 @@ def creative_synthesis_loop(gemini_client_instance, memory_manager_instance):
     """
     
     logger.info("   -> DMN: Brainstorming a new goal idea...")
-    new_goal_idea = gemini_client_instance.ask_gemini(brainstorm_prompt, tier='tier1')
+    response = gemini_client_instance.ask_gemini(brainstorm_prompt, tier='tier1')
     
-    if not new_goal_idea:
+    if not response or not hasattr(response, 'text') or not response.text:
         logger.error("   -> DMN ERROR: Brainstorming did not produce a goal.")
         return
 
-    new_goal_idea = new_goal_idea.strip()
+    new_goal_idea = response.text.strip()
     logger.info(f"   -> DMN: Generated Goal Idea: '{new_goal_idea}'")
 
     # MODIFIED: Use the central planning orchestrator for the new idea
@@ -110,7 +110,12 @@ def generate_eod_summary(memory_manager_instance, gemini_client_instance):
             """
             
             logger.info("   -> EOD Summary: Generating summary with Gemini...")
-            summary = gemini_client_instance.ask_gemini(prompt, tier='tier1')
+            response = gemini_client_instance.ask_gemini(prompt, tier='tier1')
+
+            if response and hasattr(response, 'text'):
+                summary = response.text
+            else:
+                summary = None
 
     except Exception as e:
         logger.error(f"   -> EOD Summary ERROR: Could not retrieve memories. {e}")
