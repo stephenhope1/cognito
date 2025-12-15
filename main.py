@@ -4,34 +4,46 @@ import os
 import concurrent.futures
 import json
 from datetime import datetime, timedelta
+from typing import Dict, Any
+
+# Internal Core Imports
 from core.context import rate_limiter, gemini_client, memory_manager, logger, status_update_queue, orchestrator_wake_event
 from core.dmn import generate_eod_summary, run_dmn_tasks
 from core.planner import orchestrate_planning
 from core.tools import TOOL_EXECUTOR, TOOL_MANIFEST
-# --- IMPORT UPDATE: Use the new TaskSpec ---
 from core.executor import run_executor, ExecutorTaskSpec
 from core.context_curator import ContextCurator
-from google.genai import types
 from utils.database import get_active_goal, update_goal, archive_goal, add_goal, get_recent_failed_goals, get_goal_status_by_id, get_goal_by_id
-from pydantic import BaseModel, Field
-from typing import Dict, Any
 
-# --- Configuration ---
+# Google GenAI Imports
+from google.genai import types
+from pydantic import BaseModel, Field
+
+# --- System Configuration ---
 MAX_RETRIES = 2
 IDLE_THRESHOLD_SECONDS = 300 
 REACT_MAX_ITERATIONS = 10 
 
-# ... (Helper functions: should_trigger_dmn, should_trigger_summary remain unchanged) ...
+# =================================================================================================
+# HELPER FUNCTIONS
+# =================================================================================================
 
 def should_trigger_dmn(rate_limiter_instance, last_active_time: float) -> bool:
+    """
+    Checks if the Default Mode Network (background dreaming/cleanup) should run.
+    Triggered if system is idle AND we have surplus API quota.
+    """
     idle_duration = time.time() - last_active_time
     if idle_duration <= IDLE_THRESHOLD_SECONDS: return False 
     try:
         t1_usage_pct = rate_limiter_instance.get_daily_usage_percentage('tier1')
         t2_usage_pct = rate_limiter_instance.get_daily_usage_percentage('tier2')
         time_elapsed_pct = rate_limiter_instance.get_time_elapsed_percentage()
+
+        # Calculate surplus (Time Elapsed % - Usage %)
         t1_surplus = time_elapsed_pct - t1_usage_pct
         t2_surplus = time_elapsed_pct - t2_usage_pct
+
         DMN_TRIGGER_THRESHOLD = 25.0 
         if t1_surplus > DMN_TRIGGER_THRESHOLD or t2_surplus > DMN_TRIGGER_THRESHOLD:
             logger.info(f"DMN trigger conditions met. API Surplus available.")
@@ -42,26 +54,39 @@ def should_trigger_dmn(rate_limiter_instance, last_active_time: float) -> bool:
         return False
 
 def should_trigger_summary() -> bool:
+    """
+    Checks if it's time to generate the End-of-Day summary.
+    Triggered once every 24 hours.
+    """
     report_dir = 'data/reports'
     os.makedirs(report_dir, exist_ok=True)
     summaries = [f for f in os.listdir(report_dir) if f.endswith('_summary.md')]
     if not summaries: return True
+
     latest_summary = sorted(summaries, reverse=True)[0]
     latest_summary_path = os.path.join(report_dir, latest_summary)
     last_mod_time = datetime.fromtimestamp(os.path.getmtime(latest_summary_path))
+
     if datetime.now() - last_mod_time > timedelta(hours=24): return True
     return False
 
 def _add_citations_to_response(response: types.GenerateContentResponse) -> str:
+    """
+    Extracts grounding metadata from Google Search responses and injects markdown citations.
+    """
     try:
         if not response.candidates: return response.text
         candidate = response.candidates[0]
         metadata = candidate.grounding_metadata
         if not metadata or not metadata.grounding_supports: return response.text
+
         text = response.text
         supports = metadata.grounding_supports
         chunks = metadata.grounding_chunks
+
+        # Process supports in reverse order to avoid index shifts when inserting text
         sorted_supports = sorted(supports, key=lambda s: s.segment.end_index, reverse=True)
+
         for support in sorted_supports:
             end_index = support.segment.end_index
             citation_links = []
@@ -79,19 +104,34 @@ def _add_citations_to_response(response: types.GenerateContentResponse) -> str:
         return response.text if response else ""
     
 def _execute_single_action(tool_call: dict, context_map: dict, active_goal: dict) -> str:
+    """
+    Executes a standard tool (file I/O, email, etc.) that doesn't require the ReAct loop.
+    Resolves parameter references from the context map.
+    """
     tool_name = tool_call.get("tool_name")
     parameters_input = tool_call.get("parameters", {})
     parameters = {}
+
+    # Parse parameters if they are a JSON string
     if isinstance(parameters_input, dict): parameters = parameters_input
     elif isinstance(parameters_input, str):
         try: parameters = json.loads(parameters_input)
         except json.JSONDecodeError: return "Error: Failed to decode parameters string."
+
+    # Resolve Context Variables (e.g. "[output_of_step_1]")
     for key, value in parameters.items():
         if isinstance(value, str) and value in context_map: parameters[key] = context_map[value]
-    if tool_name in TOOL_EXECUTOR: return TOOL_EXECUTOR[tool_name](**parameters)
-    else: return f"Error: Unknown or mis-routed tool '{tool_name}'"
+
+    if tool_name in TOOL_EXECUTOR:
+        return TOOL_EXECUTOR[tool_name](**parameters)
+    else:
+        return f"Error: Unknown or mis-routed tool '{tool_name}'"
 
 def _build_native_tools_list() -> list[types.Tool]:
+    """
+    Converts our TOOL_MANIFEST into the format required by the Google GenAI SDK.
+    Skips 'reactive_solve' as it is a meta-tool.
+    """
     native_tools = []
     NATIVE_TOOLS_SKIP_LIST = ["reactive_solve"]
     for tool_def in TOOL_MANIFEST:
@@ -100,17 +140,18 @@ def _build_native_tools_list() -> list[types.Tool]:
             func = types.FunctionDeclaration(name=tool_def['tool_name'], description=tool_def['description'])
             schema_properties = {}
             required_params = []
+
             for param in tool_def.get('parameters', []):
                 param_name = param['name']
                 type_mapping = {"string": "STRING", "number": "NUMBER", "integer": "INTEGER"}
                 schema_properties[param_name] = types.Schema(type=type_mapping.get(param['type'], "STRING"), description=param.get('description'))
                 required_params.append(param_name)
+
             func.parameters = types.Schema(type="OBJECT", properties=schema_properties, required=required_params)
             native_tools.append(types.Tool(function_declarations=[func]))
         except Exception as e: logger.error(f"Error converting tool: {e}")
     return native_tools
 
-# --- NEW HELPER: Unified Native Tool Execution ---
 def execute_native_tool(tool_name: str, tool_input: str, tier: str) -> str:
     """
     Centralized logic for executing Google Search, Code, and Maps.
@@ -149,11 +190,38 @@ def execute_native_tool(tool_name: str, tool_input: str, tier: str) -> str:
 
     return observation
 
-# --- NEW: The "Hot Start" ReAct Loop ---
+def _generate_step_summary(step_output: str) -> str:
+    """
+    Generates a concise 1-sentence summary of the step output for the Context Curator.
+    This creates the "index" that allows for efficient retrieval later.
+    """
+    try:
+        if not step_output: return "No output produced."
+        if len(step_output) < 200: return step_output # Short enough already
+
+        prompt = f"Summarize this output in one concise sentence: {step_output[:5000]}"
+        response = gemini_client.ask_gemini(prompt, tier='tier2')
+
+        if response and hasattr(response, 'text'):
+            return response.text.strip()
+        return step_output[:100] + "..."
+    except Exception as e:
+        logger.error(f"Error generating summary: {e}")
+        return "Summary unavailable."
+
+# =================================================================================================
+# EXECUTION LOOPS
+# =================================================================================================
+
 def _run_react_loop_with_hot_start(task_spec: ExecutorTaskSpec, context_map: dict, active_goal: dict) -> str:
     """
-    Runs the ReAct loop with a 'Hot Start' where the first tool call
-    is executed programmatically BEFORE the LLM is even invoked.
+    Runs the ReAct loop with a 'Hot Start' optimization.
+
+    Concept:
+    Instead of asking the LLM "What should I do?" and waiting for it to say "Search for X",
+    the Executor has already determined "Search for X" is the best first move.
+    We programmatically execute that move and feed the result into the LLM history *as if* it asked for it.
+    This saves 1 full inference round-trip.
     """
     logger.info(f"REACT_LOOP: Hot Start initiated for task: {task_spec.task_description[:100]}...")
     
@@ -184,7 +252,7 @@ def _run_react_loop_with_hot_start(task_spec: ExecutorTaskSpec, context_map: dic
             types.Part(function_call=types.FunctionCall(name=tool_name, args={"prompt": tool_input}))
         ]))
         
-        # B2. Execute the tool directly (Using new helper)
+        # B2. Execute the tool directly
         observation = execute_native_tool(tool_name, tool_input, active_tier)
 
         # B3. Inject "Tool Output" turn
@@ -248,7 +316,10 @@ def _run_react_loop_with_hot_start(task_spec: ExecutorTaskSpec, context_map: dic
     return "Max iterations reached."
 
 def _execute_step(step: dict, goal: dict, context_map: dict) -> tuple[int, str | None]:
-    """Executes a single step."""
+    """
+    Executes a single step from the plan.
+    Dispatches to either the ReAct loop (for complex tasks) or a single tool execution.
+    """
     step_id = step.get('step_id')
     active_tier = goal.get('preferred_tier', 'tier1')
     
@@ -258,12 +329,12 @@ def _execute_step(step: dict, goal: dict, context_map: dict) -> tuple[int, str |
             tool_name = tool_call.get("tool_name")
             parameters = tool_call.get("parameters", {})
 
-            # --- FIXED BLOCK: Use Hot Start with correct object access ---
+            # --- CASE 1: Reactive Solve (Complex Sub-goal) ---
             if tool_name == "reactive_solve":
                 simple_sub_goal = parameters.get("sub_goal", "")
                 logger.info(f"EXECUTOR (Step {step_id}): Generating TaskSpec for: '{simple_sub_goal}'")
                 
-                # Call Executor -> returns ExecutorTaskSpec object
+                # 1. Generate TaskSpec (Architect Phase)
                 task_spec = run_executor(
                     user_goal=goal['goal'], full_plan=goal.get('plan', []), 
                     strategy_blueprint=goal.get('strategy_blueprint', {}),
@@ -271,6 +342,7 @@ def _execute_step(step: dict, goal: dict, context_map: dict) -> tuple[int, str |
                     gemini_client=gemini_client, task_type="refine_subgoal"
                 )
                 
+                # Ensure object type
                 if isinstance(task_spec, dict):
                      try:
                         task_spec = ExecutorTaskSpec(**task_spec)
@@ -278,22 +350,24 @@ def _execute_step(step: dict, goal: dict, context_map: dict) -> tuple[int, str |
                         logger.error(f"Failed to cast TaskSpec: {e}")
                         task_spec = ExecutorTaskSpec(primary_tool="none", initial_inputs=[], task_description=simple_sub_goal)
 
+                # 2. Run ReAct Loop with Hot Start
                 result = _run_react_loop_with_hot_start(task_spec, context_map, goal)
                 return step_id, result
 
-            # --- REFACTORED: Use Unified Helper ---
+            # --- CASE 2: Native Tool Direct Call ---
             elif tool_name in ["google_search", "get_maps_data", "execute_python_code"]:
                 refined_prompt = run_executor(goal['goal'], [], {}, context_map, parameters.get("prompt") or parameters.get("query"), gemini_client, "refine_query")
                 
-                # Call unified helper
                 resp = execute_native_tool(tool_name, refined_prompt, active_tier)
                 
                 if resp == "RATE_LIMIT_HIT": return step_id, "RATE_LIMIT_HIT"
                 return step_id, resp
                 
+            # --- CASE 3: Standard Tool ---
             else:
                 return step_id, _execute_single_action(tool_call, context_map, goal)
 
+        # --- CASE 4: Pure Prompt (No Tool) ---
         elif step.get("prompt"):
             refined_prompt = run_executor(goal['goal'], [], {}, context_map, step.get("prompt"), gemini_client, "refine_prompt")
             resp = gemini_client.ask_gemini(refined_prompt, tier=active_tier)
@@ -308,7 +382,6 @@ def _execute_step(step: dict, goal: dict, context_map: dict) -> tuple[int, str |
         logger.error(f"Error executing step {step_id}: {e}", exc_info=True)
         return step_id, f"Error: {e}"
 
-# --- NEW FEATURE: Real Plan Monitoring ---
 def _run_plan_monitor(user_goal: str, remaining_plan: list, last_step_output: str) -> str:
     """
     Intelligently checks if the last step's output actually moved the needle.
@@ -342,22 +415,9 @@ def _run_plan_monitor(user_goal: str, remaining_plan: list, last_step_output: st
             
     return "CONTINUE"
 
-# --- NEW: Context Summary Generator ---
-def _generate_step_summary(step_output: str) -> str:
-    """Generates a concise 1-sentence summary of the step output for the Context Curator."""
-    try:
-        if not step_output: return "No output produced."
-        if len(step_output) < 200: return step_output # Short enough already
-
-        prompt = f"Summarize this output in one concise sentence: {step_output[:5000]}"
-        response = gemini_client.ask_gemini(prompt, tier='tier2')
-
-        if response and hasattr(response, 'text'):
-            return response.text.strip()
-        return step_output[:100] + "..."
-    except Exception as e:
-        logger.error(f"Error generating summary: {e}")
-        return "Summary unavailable."
+# =================================================================================================
+# MAIN ORCHESTRATOR
+# =================================================================================================
 
 def main():
     """The main orchestrator loop."""
@@ -365,34 +425,43 @@ def main():
     last_active_time = time.time()
     
     while True:
+        # 1. Efficient Waiting (Wake on Event or Timeout)
         orchestrator_wake_event.wait(timeout=30)
         if orchestrator_wake_event.is_set():
             logger.info(">>> WAKE SIGNAL RECEIVED! Resuming immediately.")
             orchestrator_wake_event.clear()
 
+        # 2. Fetch Goal
         active_goal = get_active_goal()
         
         if active_goal:
             last_active_time = time.time()
             current_db_status = get_goal_status_by_id(active_goal['goal_id'])
             
+            # Handle External Cancellation
             if current_db_status == 'cancelled':
                 logger.warning(f"Orchestrator: Goal '{active_goal['goal_id']}' was cancelled externally. Dropping.")
                 active_goal = None 
                 continue 
             
+            # Sync Status
             if current_db_status and current_db_status != active_goal['status']:
                  active_goal['status'] = current_db_status
 
+            # --- STATUS: AWAITING REPLAN ---
             if active_goal.get('status') == 'awaiting_replan':
                 logger.info(f"RE-PLANNER: Goal '{active_goal['goal_id']}' requires re-planning.")
+
+                # Gather context from the failed run
                 context_parts = []
                 for step in active_goal.get('plan', []):
                     if step.get('status') == 'complete' and step.get('output'):
                         context_parts.append(f"Data from previous attempt (Step {step['step_id']}):\n{step['output']}\n---")
                 existing_context_str = "\n".join(context_parts)
+
                 archive_goal(active_goal['goal_id'])
                 
+                # Re-run Planner
                 new_goal_obj = orchestrate_planning(
                     user_goal=active_goal['goal'],
                     preferred_tier=active_goal.get('preferred_tier', 'tier1'),
@@ -400,6 +469,7 @@ def main():
                 )
                 
                 if new_goal_obj:
+                    # Versioning for Re-plans
                     new_goal_obj['replan_count'] = active_goal.get('replan_count', 0) + 1
                     timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
                     new_goal_obj['goal_id'] = f"replan_{new_goal_obj['replan_count']}_{timestamp_str}"
@@ -410,16 +480,19 @@ def main():
                 
                 continue
 
+            # --- STATUS: IN PROGRESS ---
             if active_goal.get('status') == 'pending' and active_goal.get('plan'):
                 active_goal['status'] = 'in-progress'
             
+            # Determine Executable Steps (Dependency Graph)
             completed_step_ids = {s['step_id'] for s in active_goal['plan'] if s['status'] == 'complete'}
             executable_steps = [s for s in active_goal['plan'] if s['status'] == 'pending' and set(s.get('dependencies', [])).issubset(completed_step_ids)]
             
             if not executable_steps:
                pass
             else:
-                # Identify Heavyweight Step
+                # 3a. Priority Execution: Heavyweight Tasks (e.g., reactive_solve)
+                # We execute these one-by-one to allow for deep reasoning and monitoring.
                 heavyweight_step = next(
                     (step for step in executable_steps 
                      if step and (step.get("tool_call") or {}).get("tool_name") == "reactive_solve"), 
@@ -430,10 +503,9 @@ def main():
                     logger.info(f"Prioritizing heavyweight task: Step {heavyweight_step.get('step_id')}.")
 
                     # --- CONTEXT CURATION (HYDRAULIC SYSTEM) ---
+                    # Select only relevant context for this specific task
                     completed_steps_list = [s for s in active_goal['plan'] if s['status'] == 'complete']
-                    # We use the raw prompt or tool call as the "Task" description for the curator
                     current_task_desc = heavyweight_step.get('prompt') or str(heavyweight_step.get('tool_call'))
-
                     context_map = ContextCurator.get_relevant_context(current_task_desc, completed_steps_list)
                     # -------------------------------------------
 
@@ -441,10 +513,12 @@ def main():
                     
                     if response:
                         heavyweight_step['output'] = response
+                        # Generate summary for the Curator Index
                         heavyweight_step['summary'] = _generate_step_summary(response)
                         heavyweight_step['status'] = 'complete'
                         
-                        # --- MONITOR CHECK FOR HEAVYWEIGHT ---
+                        # --- MONITOR CHECK ---
+                        # If the result is bad, trigger a replan immediately
                         remaining = [s for s in active_goal['plan'] if s['status'] == 'pending' and s['step_id'] > step_id]
                         if _run_plan_monitor(active_goal['goal'], remaining, response) == "REPLAN":
                              active_goal['status'] = 'awaiting_replan'
@@ -454,21 +528,20 @@ def main():
 
                         update_goal(active_goal)
                         status_update_queue.put("goal_updated")
+
+                # 3b. Swarm Execution: Parallel Tasks
+                # Lighter tasks (simple tools, files) can run in parallel.
                 else:
-                    # --- Swarm Execution ---
                     logger.info(f"Found a swarm of {len(executable_steps)} executable steps. Dispatching...")
 
-                    # Pre-calculate completed steps once
                     completed_steps_list = [s for s in active_goal['plan'] if s['status'] == 'complete']
 
                     with concurrent.futures.ThreadPoolExecutor(max_workers=len(executable_steps)) as executor:
-                        # For swarm, we must curate context INDIVIDUALLY for each parallel step
                         future_to_step = {}
 
                         for step in executable_steps:
+                            # --- PER-THREAD CONTEXT CURATION ---
                             current_task_desc = step.get('prompt') or str(step.get('tool_call'))
-                            # Note: This adds N calls to Curator. Acceptable for quality.
-                            # Optimization: Could cache if multiple steps are identical? Unlikely.
                             step_context = ContextCurator.get_relevant_context(current_task_desc, completed_steps_list)
 
                             future = executor.submit(_execute_step, step, active_goal, step_context)
@@ -484,7 +557,7 @@ def main():
                                 step['status'] = 'complete'
                                 logger.info(f"Step {step_id} completed successfully in swarm.")
                                 
-                                # --- MONITOR CHECK FOR SWARM ---
+                                # Monitor check for critical failures in swarm
                                 remaining = [s for s in active_goal['plan'] if s['status'] == 'pending' and s['step_id'] > step_id]
                                 if _run_plan_monitor(active_goal['goal'], remaining, response) == "REPLAN":
                                     active_goal['status'] = 'awaiting_replan'
@@ -514,6 +587,7 @@ def main():
                     update_goal(active_goal)
                     status_update_queue.put("goal_updated")
 
+        # 4. Background Tasks (Summary, DMN, Sleep)
         elif should_trigger_summary():
             generate_eod_summary(memory_manager, gemini_client)
         elif should_trigger_dmn(rate_limiter, last_active_time):

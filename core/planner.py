@@ -16,20 +16,38 @@ AGENT_PROFILE_FOR_PLANNER = get_agent_profile(for_planner=True)
 
 # --- MODERN PYDANTIC DEFINITIONS ---
 class ToolCall(BaseModel):
-    tool_name: str
-    parameters: Dict[str, Any] = Field(default_factory=dict)
+    """
+    Represents a tool invocation within a plan step.
+    """
+    tool_name: str = Field(..., description="The name of the tool to be executed.")
+    parameters: Dict[str, Any] = Field(default_factory=dict, description="Key-value arguments for the tool.")
 
 class PlanStep(BaseModel):
-    step_id: int
-    dependencies: List[int]
-    prompt: Optional[str] = None
-    tool_call: Optional[ToolCall] = None
+    """
+    Represents a single step in the execution plan.
+    Each step must either contain a 'prompt' (for pure LLM tasks) or a 'tool_call' (for actions).
+    """
+    step_id: int = Field(..., description="Unique identifier for this step.")
+    dependencies: List[int] = Field(default_factory=list, description="IDs of steps that must complete before this one.")
+    prompt: Optional[str] = Field(None, description="LLM instruction for this step (if no tool is used).")
+    tool_call: Optional[ToolCall] = Field(None, description="The tool to execute for this step (if applicable).")
 
 class Plan(BaseModel):
+    """
+    Container for the full list of steps.
+    """
     plan: List[PlanStep]
 
 def validate_plan(plan_data: list) -> tuple[bool, str | None]:
-    """Validates the structure using Pydantic logic."""
+    """
+    Validates the structure of the generated plan using Pydantic models.
+
+    Args:
+        plan_data: The raw list of dictionaries returned by the LLM.
+
+    Returns:
+        tuple: (is_valid: bool, error_message: str|None)
+    """
     logger.info("VALIDATOR: Validating plan structure...")
     
     try:
@@ -38,13 +56,16 @@ def validate_plan(plan_data: list) -> tuple[bool, str | None]:
         
         # Additional Logic Checks
         for i, step in enumerate(validated.plan):
+            # Mutual exclusion check: Prompt vs Tool Call
             if step.prompt and step.tool_call:
                 return False, f"Step {step.step_id} cannot have both 'prompt' and 'tool_call'."
             if not step.prompt and not step.tool_call:
                 return False, f"Step {step.step_id} must have either 'prompt' or 'tool_call'."
             
+            # Tool existence check
             if step.tool_call:
                 tool_name = step.tool_call.tool_name
+                # 'reactive_solve' is a meta-tool handled by the Executor, not in TOOL_MANIFEST
                 if tool_name != "reactive_solve":
                     if not any(t['tool_name'] == tool_name for t in TOOL_MANIFEST):
                         return False, f"Unknown tool: {tool_name}"
@@ -59,14 +80,30 @@ def validate_plan(plan_data: list) -> tuple[bool, str | None]:
         return False, f"Unexpected validation error: {e}"
 
 def orchestrate_planning(user_goal: str, preferred_tier: str = 'tier1', existing_context_str: str = None) -> dict | None:
-    """Orchestrates the planning process."""
+    """
+    The main entry point for the Planning Phase.
+
+    Workflow:
+    1. Run the Strategist to determine the approach (cognitive gear).
+    2. If clarification is needed, return a plan requesting user input.
+    3. Generate the step-by-step plan using the LLM (with retries).
+    4. Validate the plan structure.
+
+    Args:
+        user_goal: The raw goal string from the user.
+        preferred_tier: The API tier to use (tier1/tier2).
+        existing_context_str: Optional context from previous failures (for replanning).
+
+    Returns:
+        dict: The final goal object including the plan and metadata, or None if failed.
+    """
     logger.info(f"PLANNING ORCHESTRATOR: Starting planning for goal: '{user_goal}'")
 
     # 1. Run Strategist
     strategy_blueprint = run_strategist(user_goal)
     if not strategy_blueprint: return None
 
-    # 2. Handle Clarification
+    # 2. Handle Clarification (Pre-Planning)
     if strategy_blueprint.requires_clarification and not existing_context_str:
         clarification_plan = [{
             "step_id": 1, "dependencies": [],
@@ -87,32 +124,38 @@ def orchestrate_planning(user_goal: str, preferred_tier: str = 'tier1', existing
     retry_count = 0
     is_valid = False
 
-    # 3. Planning Loop
+    # 3. Planning Loop with Retries
     while retry_count <= MAX_PLANNING_RETRIES:
         plan_json = generate_plan(user_goal, strategy_blueprint.model_dump(), gemini_client, retry_context, preferred_tier, existing_context_str)
         
+        # Handle API Rate Limits
         if plan_json == "RATE_LIMIT_HIT":
             rate_limit_retries += 1
             time.sleep(30)
             if rate_limit_retries > MAX_PLANNING_RETRIES: return None
             continue
 
+        # Handle Empty/Failed Generation
         if not plan_json:
             retry_count += 1
             retry_context = {"previous_invalid_plan": "None", "validation_error": "Planner returned empty/invalid JSON."}
             if retry_count > MAX_PLANNING_RETRIES: break 
             continue
 
+        # Validate Generated Plan
         is_valid, validation_error = validate_plan(plan_json)
         
         if is_valid: break
 
+        # Prepare for Retry if Invalid
         retry_count += 1
         retry_context = {"previous_invalid_plan": plan_json, "validation_error": validation_error}
 
     if is_valid:
-        # Ensure we return a clean list of dicts
+        # Normalize the plan steps (convert Pydantic models to dicts)
         clean_plan = [step.model_dump() if hasattr(step, 'model_dump') else step for step in Plan(plan=plan_json).plan]
+
+        # Return the structured Goal Object
         return {
             "goal": user_goal,
             "plan": [{**step, "status": "pending", "output": None} for step in clean_plan],
@@ -126,7 +169,10 @@ def orchestrate_planning(user_goal: str, preferred_tier: str = 'tier1', existing
     return None
 
 def generate_plan(user_goal: str, strategy_blueprint: dict, gemini_client, retry_context: dict = None, tier: str = 'tier1', existing_context_str: str = None) -> list | None | str:
-    # Use response_mime_type="application/json" for JSON Mode.
+    """
+    Generates the raw JSON plan from the LLM based on strategy and context.
+    """
+    # Use response_mime_type="application/json" for forced JSON output.
     planner_generation_config = {
         "temperature": 0.1,
         "response_mime_type": "application/json" 
@@ -134,6 +180,7 @@ def generate_plan(user_goal: str, strategy_blueprint: dict, gemini_client, retry
     
     current_date_str = datetime.now().strftime("%A, %B %d, %Y")
     
+    # Construct Context Strings
     retry_str = ""
     if retry_context:
         retry_str = f"**RETRY CONTEXT:** Previous error: {retry_context.get('validation_error')}. Fix the plan structure."
@@ -142,6 +189,7 @@ def generate_plan(user_goal: str, strategy_blueprint: dict, gemini_client, retry
     if existing_context_str:
         context_str = f"**RE-PLANNING CONTEXT:**\n{existing_context_str}"
         
+    # Heuristics Injection (RAG)
     heuristic_prompt_addition = ""
     try:
         heuristics = memory_manager.find_similar_memories(query_text=user_goal, n_results=3, where_filter={"type": "heuristic"})
@@ -150,6 +198,7 @@ def generate_plan(user_goal: str, strategy_blueprint: dict, gemini_client, retry
             heuristic_prompt_addition = f"**RELEVANT HEURISTICS:**\n{heuristics_str}"
     except Exception: pass
 
+    # User Profile Injection
     user_profile_addition = ""
     try:
         profile = get_user_profile()
@@ -160,6 +209,7 @@ def generate_plan(user_goal: str, strategy_blueprint: dict, gemini_client, retry
 
     system_instruction = AGENT_PROFILE_FOR_PLANNER
     
+    # Final Prompt Assembly
     prompt = f"""
     {retry_str}
     **TASK:** Create a JSON plan for: "{user_goal}"
@@ -177,7 +227,7 @@ def generate_plan(user_goal: str, strategy_blueprint: dict, gemini_client, retry
     try:
         response = gemini_client.ask_gemini(
             prompt, tier=tier, generation_config=planner_generation_config,
-            # response_schema=None, 
+            # response_schema=None, # We rely on text parsing for maximum flexibility here
             system_instruction=system_instruction
         )
         
@@ -187,7 +237,7 @@ def generate_plan(user_goal: str, strategy_blueprint: dict, gemini_client, retry
             try:
                 parsed = json.loads(response.text)
                 
-                # --- CRITICAL FIX FOR 'list' object has no attribute 'get' ---
+                # Robustly handle different top-level JSON structures
                 if isinstance(parsed, list):
                     # The model returned the list directly (e.g. [step1, step2])
                     return parsed

@@ -2,10 +2,14 @@ from core.context import logger
 import json
 from pydantic import BaseModel, Field
 from typing import Literal, Union, List, Optional
+from .agent_profile import get_agent_profile
 
-# --- NEW: Structured Task Object ---
-# This replaces the vague "refined prompt" string.
+# --- Structured Task Definition ---
 class ExecutorTaskSpec(BaseModel):
+    """
+    Defines the structured output of the Executor.
+    This tells the ReAct loop exactly how to 'Hot Start' the task.
+    """
     primary_tool: Literal["google_search", "get_maps_data", "execute_python_code", "none"] = Field(
         description="The single best tool to start this task. Use 'none' if no tool is needed immediately."
     )
@@ -16,10 +20,9 @@ class ExecutorTaskSpec(BaseModel):
         description="A concise, imperative instruction for the ReAct agent on what to do with the tool output."
     )
 
-from .agent_profile import get_agent_profile
 AGENT_PROFILE = get_agent_profile(for_planner=False)
 
-# --- UPDATED EXAMPLES ---
+# --- Few-Shot Examples for Prompting ---
 SUBGOAL_EXAMPLES = """
 **EXAMPLE 1: Research**
 Input: "Find out the capital of Canada."
@@ -54,18 +57,37 @@ YOUR OUTPUT: ("Supreme Court of Canada" OR SCC) AND (judgments OR decisions) AND
 
 def run_executor(user_goal: str, full_plan: list, strategy_blueprint: dict, context_map: dict, current_step_prompt: str, gemini_client, task_type: str) -> Union[str, dict, ExecutorTaskSpec]: 
     """
-    Takes a simple plan step and converts it into a structured TaskSpec or refined text.
+    The Executor's role is to refine a high-level plan step into a concrete, executable instruction.
+
+    Modes:
+    1. refine_prompt: Simply rewrites a text prompt to be more expert-like.
+    2. refine_subgoal: Converts a goal into an `ExecutorTaskSpec` (Tool + Input + Instruction).
+    3. refine_query: Optimizes a search string for Google.
+
+    Args:
+        user_goal: The overall user objective.
+        full_plan: The complete list of steps.
+        strategy_blueprint: The strategy object from the Planner.
+        context_map: A dictionary of {source: content} for available context.
+        current_step_prompt: The raw instruction from the plan.
+        gemini_client: The LLM client.
+        task_type: One of 'refine_prompt', 'refine_subgoal', 'refine_query'.
+
+    Returns:
+        Union[str, ExecutorTaskSpec]: either refined text or a structured object.
     """
     logger.info(f"EXECUTOR: Refining task (type: {task_type}) for step: '{current_step_prompt}'")
 
+    # Serialize context for the prompt
     context_str = "\n".join([f"CONTEXT FOR `{k}`: {v}" for k, v in context_map.items()])
     plan_str = json.dumps(full_plan, indent=2)
 
-    executor_generation_config = {"temperature": 0.1} # Lower temp for structure
+    executor_generation_config = {"temperature": 0.1} # Lower temp for structure reliability
     response_schema = None
     persona = ""
     task_instructions = ""
 
+    # --- Prompt Construction based on Task Type ---
     if task_type == "refine_prompt":
         persona = "You are the 'Executor'. Rewrite the simple step into an expert prompt."
         task_instructions = f"Refine this step: '{current_step_prompt}'"
@@ -98,7 +120,7 @@ def run_executor(user_goal: str, full_plan: list, strategy_blueprint: dict, cont
         persona = "You are a 'Search Query Expert'. Output ONLY the optimized search string."
         task_instructions = f"Optimize this query: '{current_step_prompt}'"
 
-    prompt = f"""
+    final_prompt = f"""
     **CONTEXT (FOR YOUR USE ONLY)**
     **The User's Overall Goal:** "{user_goal}"
     **The Full Strategic Plan:** {plan_str}
@@ -107,26 +129,30 @@ def run_executor(user_goal: str, full_plan: list, strategy_blueprint: dict, cont
     {task_instructions}
     """
 
+    # --- LLM Call ---
     response = gemini_client.ask_gemini(
-        prompt, 
+        final_prompt,
         tier='tier2',
         generation_config=executor_generation_config,
         response_schema=response_schema,
         system_instruction=persona
     )
 
+    # --- Response Handling ---
     if task_type == "refine_subgoal":
         if response and hasattr(response, 'parsed'):
             logger.info("EXECUTOR: Successfully generated TaskSpec.")
             return response.parsed # Returns ExecutorTaskSpec object
         else:
-            logger.warning("EXECUTOR: Failed to generate TaskSpec. Returning default.")
+            logger.warning("EXECUTOR: Failed to generate TaskSpec. Returning default fallback.")
+            # Fallback: Treat as a generic task with no immediate tool
             return ExecutorTaskSpec(
                 primary_tool="none", 
                 initial_inputs=[], 
                 task_description=current_step_prompt
             )
     else:
+        # For text-based refinements
         if response == "RATE_LIMIT_HIT": return current_step_prompt
         if response and response.text: return response.text.strip()
         return current_step_prompt

@@ -6,7 +6,11 @@ from pydantic import BaseModel
 class ContextCurator:
     """
     The 'Hydraulic' Context Engineer.
-    It selectively pressurizes only the relevant information for the current task.
+
+    This class is responsible for managing the "pressure" of information flow.
+    Instead of dumping all previous step outputs into the context window (which wastes tokens
+    and confuses the model), the Curator selectively "hydrates" only the specific pieces
+    of information required for the current task.
     """
 
     @staticmethod
@@ -20,12 +24,13 @@ class ContextCurator:
             completed_steps: List of dicts containing 'step_id', 'output', and 'summary'.
 
         Returns:
-            A context_map containing only the outputs of selected steps.
+            A context_map containing only the FULL outputs of the selected steps.
         """
         if not completed_steps:
             return {}
 
         # 1. Build the "Menu"
+        # We present a lightweight index (ID + Summary) to the LLM to keep this decision cheap.
         menu_items = []
         for step in completed_steps:
             s_id = step.get('step_id')
@@ -35,7 +40,7 @@ class ContextCurator:
         menu_str = "\n".join(menu_items)
 
         # 2. Ask the LLM to Select
-        # We use a structured JSON output for reliability
+        # We use a structured JSON output for reliability and ease of parsing.
         prompt = f"""
         **ROLE:** You are a Context Curator. Your job is to select strictly necessary information for the execution of a specific task.
 
@@ -66,7 +71,7 @@ class ContextCurator:
                 try:
                     data = json.loads(response.text)
                     selected_ids = data.get("selected_step_ids", [])
-                    # Handle if model returns a single int instead of list
+                    # Handle edge case where model might return a single int instead of list
                     if isinstance(selected_ids, int): selected_ids = [selected_ids]
                 except json.JSONDecodeError:
                     logger.error("ContextCurator: Failed to parse JSON selection.")
@@ -74,10 +79,7 @@ class ContextCurator:
             # 3. Hydrate the Context (Pressurize the selected lines)
             context_map = {}
 
-            # Optimization: If list is empty but task explicitly mentions "Step X", fallback?
-            # For now, trust the model.
-
-            logger.info(f"ContextCurator: Task '{current_task[:50]}' requires steps: {selected_ids}")
+            logger.info(f"ContextCurator: Task '{current_task[:50]}...' requires steps: {selected_ids}")
 
             for step in completed_steps:
                 if step['step_id'] in selected_ids:
@@ -89,8 +91,7 @@ class ContextCurator:
 
         except Exception as e:
             logger.error(f"ContextCurator Error: {e}")
-            # Fallback: Return everything if curation fails?
-            # Or return nothing? Safest might be last 1 step?
-            # Let's return everything to be safe against breakage, but log error.
+            # Fallback: Return everything if curation fails.
+            # This ensures the agent doesn't crash even if the Curator logic hiccups.
             logger.warning("ContextCurator: Falling back to full context due to error.")
             return {f"[output_of_step_{s['step_id']}]": s.get('output', '') for s in completed_steps}
