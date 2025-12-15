@@ -10,6 +10,7 @@ from core.planner import orchestrate_planning
 from core.tools import TOOL_EXECUTOR, TOOL_MANIFEST
 # --- IMPORT UPDATE: Use the new TaskSpec ---
 from core.executor import run_executor, ExecutorTaskSpec
+from core.context_curator import ContextCurator
 from google.genai import types
 from utils.database import get_active_goal, update_goal, archive_goal, add_goal, get_recent_failed_goals, get_goal_status_by_id, get_goal_by_id
 from pydantic import BaseModel, Field
@@ -341,6 +342,23 @@ def _run_plan_monitor(user_goal: str, remaining_plan: list, last_step_output: st
             
     return "CONTINUE"
 
+# --- NEW: Context Summary Generator ---
+def _generate_step_summary(step_output: str) -> str:
+    """Generates a concise 1-sentence summary of the step output for the Context Curator."""
+    try:
+        if not step_output: return "No output produced."
+        if len(step_output) < 200: return step_output # Short enough already
+
+        prompt = f"Summarize this output in one concise sentence: {step_output[:5000]}"
+        response = gemini_client.ask_gemini(prompt, tier='tier2')
+
+        if response and hasattr(response, 'text'):
+            return response.text.strip()
+        return step_output[:100] + "..."
+    except Exception as e:
+        logger.error(f"Error generating summary: {e}")
+        return "Summary unavailable."
+
 def main():
     """The main orchestrator loop."""
     logger.info("--- ⚙️ Orchestrator v12.0 Initializing (Refactored & Monitored) ---")
@@ -410,11 +428,20 @@ def main():
                 
                 if heavyweight_step:
                     logger.info(f"Prioritizing heavyweight task: Step {heavyweight_step.get('step_id')}.")
-                    context_map = {f"[output_of_step_{s.get('step_id')}]": s.get('output', '') for s in active_goal['plan'] if s['status'] == 'complete'}
+
+                    # --- CONTEXT CURATION (HYDRAULIC SYSTEM) ---
+                    completed_steps_list = [s for s in active_goal['plan'] if s['status'] == 'complete']
+                    # We use the raw prompt or tool call as the "Task" description for the curator
+                    current_task_desc = heavyweight_step.get('prompt') or str(heavyweight_step.get('tool_call'))
+
+                    context_map = ContextCurator.get_relevant_context(current_task_desc, completed_steps_list)
+                    # -------------------------------------------
+
                     step_id, response = _execute_step(heavyweight_step, active_goal, context_map)
                     
                     if response:
                         heavyweight_step['output'] = response
+                        heavyweight_step['summary'] = _generate_step_summary(response)
                         heavyweight_step['status'] = 'complete'
                         
                         # --- MONITOR CHECK FOR HEAVYWEIGHT ---
@@ -430,9 +457,22 @@ def main():
                 else:
                     # --- Swarm Execution ---
                     logger.info(f"Found a swarm of {len(executable_steps)} executable steps. Dispatching...")
+
+                    # Pre-calculate completed steps once
+                    completed_steps_list = [s for s in active_goal['plan'] if s['status'] == 'complete']
+
                     with concurrent.futures.ThreadPoolExecutor(max_workers=len(executable_steps)) as executor:
-                        context_map = {f"[output_of_step_{s.get('step_id')}]": s.get('output', '') for s in active_goal['plan'] if s['status'] == 'complete'}
-                        future_to_step = {executor.submit(_execute_step, step, active_goal, context_map): step for step in executable_steps}
+                        # For swarm, we must curate context INDIVIDUALLY for each parallel step
+                        future_to_step = {}
+
+                        for step in executable_steps:
+                            current_task_desc = step.get('prompt') or str(step.get('tool_call'))
+                            # Note: This adds N calls to Curator. Acceptable for quality.
+                            # Optimization: Could cache if multiple steps are identical? Unlikely.
+                            step_context = ContextCurator.get_relevant_context(current_task_desc, completed_steps_list)
+
+                            future = executor.submit(_execute_step, step, active_goal, step_context)
+                            future_to_step[future] = step
                         
                         for future in concurrent.futures.as_completed(future_to_step):
                             step = future_to_step[future]
@@ -440,6 +480,7 @@ def main():
                             
                             if response and response not in ["AWAITING_USER_INPUT_SIGNAL", "RATE_LIMIT_HIT"]:
                                 step['output'] = response
+                                step['summary'] = _generate_step_summary(response)
                                 step['status'] = 'complete'
                                 logger.info(f"Step {step_id} completed successfully in swarm.")
                                 
