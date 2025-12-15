@@ -2,438 +2,207 @@ import json
 import time
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Union
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-from core.context import logger, gemini_client
+from core.context import logger, gemini_client, memory_manager
 from .strategist import run_strategist
 from .tools import TOOL_MANIFEST
+from .agent_profile import get_agent_profile 
+from utils.database import get_user_profile
 
 MAX_PLANNING_RETRIES = 1
 
-PLAN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "plan": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "step_id": {"type": "integer"},
-                    "dependencies": {
-                        "type": "array",
-                        "items": {"type": "integer"}
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "A prompt for the Executor. Use this for analysis or generation."
-                    },
-                    "tool_call": {
-                        "type": "object",
-                        "properties": {
-                            "tool_name": {"type": "string"},
-                            "parameters": {
-                                "type": "string",  # CHANGED from "object"
-                                "description": "The parameters for the tool, as a single JSON-formatted string."
-                            }
-                        },
-                        "description": "A call to a specific tool. Use this for actions."
-                    }
-                },
-                "required": ["step_id", "dependencies"],
-            }
-        }
-    },
-    "required": ["plan"]
-}
+AGENT_PROFILE_FOR_PLANNER = get_agent_profile(for_planner=True)
 
-GEAR_MANDATES = {
-    "Direct_Response": "You MUST create the shortest, most direct plan possible (usually 1-2 steps). You are FORBIDDEN from adding any self-critique, verification, or other iterative steps.",
-    "Reflective_Synthesis": "You MUST include at least ONE iterative step in your plan (e.g., a 'self-critique' or 'verification' prompt). You have the AUTONOMY to decide which kind of reflection is most appropriate for the task.",
-    "Deep_Analysis": "You are AUTHORIZED and EXPECTED to use advanced, multi-call techniques like multi-perspective analysis, red-teaming, or iterative refinement to ensure the highest possible quality. Your plan MUST reflect this level of diligence."
-}
+# --- MODERN PYDANTIC DEFINITIONS ---
+class ToolCall(BaseModel):
+    tool_name: str
+    parameters: Dict[str, Any] = Field(default_factory=dict)
 
-def _force_allow_additional_properties(schema: dict) -> dict:
-    """
-    Recursively traverses a JSON schema and adds 'additionalProperties': True
-    to every object definition that doesn't already have it.
-    This is a workaround for the Gemini API's strict schema parser.
-    """
-    if not isinstance(schema, dict):
-        return schema
+class PlanStep(BaseModel):
+    step_id: int
+    dependencies: List[int]
+    prompt: Optional[str] = None
+    tool_call: Optional[ToolCall] = None
 
-    if schema.get("type") == "object" and "additionalProperties" not in schema:
-        schema["additionalProperties"] = True
+class Plan(BaseModel):
+    plan: List[PlanStep]
 
-    for key, value in schema.items():
-        if isinstance(value, dict):
-            _force_allow_additional_properties(value)
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    _force_allow_additional_properties(item)
-    return schema
-
-def validate_plan(plan: list) -> tuple[bool, str | None]:
-    """
-    Programmatically validates the structure of a generated plan.
-    Returns (True, None) on success, or (False, error_message) on failure.
-    """
+def validate_plan(plan_data: list) -> tuple[bool, str | None]:
+    """Validates the structure using Pydantic logic."""
     logger.info("VALIDATOR: Validating plan structure...")
-    error_message = None
+    
+    try:
+        # Validate the list of steps against our Pydantic model
+        validated = Plan(plan=plan_data)
+        
+        # Additional Logic Checks
+        for i, step in enumerate(validated.plan):
+            if step.prompt and step.tool_call:
+                return False, f"Step {step.step_id} cannot have both 'prompt' and 'tool_call'."
+            if not step.prompt and not step.tool_call:
+                return False, f"Step {step.step_id} must have either 'prompt' or 'tool_call'."
+            
+            if step.tool_call:
+                tool_name = step.tool_call.tool_name
+                if tool_name != "reactive_solve":
+                    if not any(t['tool_name'] == tool_name for t in TOOL_MANIFEST):
+                        return False, f"Unknown tool: {tool_name}"
 
-    SPECIAL_TOOLS = ["google_search", "request_user_input", "reactive_solve"]
-
-    if not isinstance(plan, list) or not plan:
-        error_message = "Plan is not a non-empty list."
-    else:
-        for i, step in enumerate(plan):
-            if not isinstance(step, dict):
-                error_message = f"Step {i+1} is not a dictionary."
-                break
-            if 'step_id' not in step or 'dependencies' not in step:
-                error_message = f"Step {i+1} is missing 'step_id' or 'dependencies'."
-                break
-            has_prompt = 'prompt' in step and step['prompt'] is not None
-            has_tool_call = 'tool_call' in step and step['tool_call'] is not None
-            if not (has_prompt ^ has_tool_call):
-                error_message = f"Step {i+1} must have exactly one of 'prompt' or 'tool_call'."
-                break
-            if has_tool_call:
-                tool_call = step['tool_call']
-                if not isinstance(tool_call, dict) or 'tool_name' not in tool_call or 'parameters' not in tool_call:
-                    error_message = f"Step {i+1} has a malformed 'tool_call' object."
-                    break
-                tool_name = tool_call['tool_name']
-                tool_in_manifest = any(t['tool_name'] == tool_name for t in TOOL_MANIFEST)
-                if not tool_in_manifest and tool_name not in SPECIAL_TOOLS:
-                    error_message = f"Step {i+1} references an unknown tool: '{tool_name}'."
-                    break
-
-    if error_message:
-        logger.error(f"VALIDATOR ERROR: {error_message}")
-        return False, error_message
-    else:
         logger.info("VALIDATOR: Plan structure is valid.")
         return True, None
+        
+    except ValidationError as e:
+        logger.error(f"VALIDATION ERROR: {e}")
+        return False, str(e)
+    except Exception as e:
+        return False, f"Unexpected validation error: {e}"
 
-def orchestrate_planning(user_goal: str, preferred_tier: str = 'tier1') -> dict | None:
-    """
-    Orchestrates the full Strategist -> Planner -> Validator pipeline.
-    If tier1 is rate-limited, it creates a goal in 'awaiting_tier_decision' state.
-    """
-    logger.info(f"PLANNING ORCHESTRATOR: Starting planning for goal: '{user_goal}' using tier: {preferred_tier}")
+def orchestrate_planning(user_goal: str, preferred_tier: str = 'tier1', existing_context_str: str = None) -> dict | None:
+    """Orchestrates the planning process."""
+    logger.info(f"PLANNING ORCHESTRATOR: Starting planning for goal: '{user_goal}'")
 
-    # Strategist is fast and cheap, we can leave it on tier2
+    # 1. Run Strategist
     strategy_blueprint = run_strategist(user_goal)
-    if not strategy_blueprint:
-        logger.error("PLANNING ORCHESTRATOR: Strategist failed. Aborting.")
-        return None
+    if not strategy_blueprint: return None
 
-    if strategy_blueprint.requires_clarification:
-        logger.info("PLANNING ORCHESTRATOR: Strategy requires user input. Pausing goal.")
+    # 2. Handle Clarification
+    if strategy_blueprint.requires_clarification and not existing_context_str:
         clarification_plan = [{
             "step_id": 1, "dependencies": [],
             "tool_call": {
                 "tool_name": "request_user_input",
-                "parameters": json.dumps({"question": strategy_blueprint.clarification_question})
+                "parameters": {"question": strategy_blueprint.clarification_question}
             }, "status": "pending", "output": None
         }]
         return {
-            "goal": user_goal, "plan": clarification_plan,
-            "status": "awaiting_input",
-            "audit_critique": "Awaiting user clarification before full planning.",
-            "strategy_blueprint": strategy_blueprint.model_dump(),
-            "preferred_tier": preferred_tier
+            "goal": user_goal, "plan": clarification_plan, "status": "awaiting_input",
+            "audit_critique": "Awaiting user clarification.",
+            "strategy_blueprint": strategy_blueprint.model_dump(), "preferred_tier": preferred_tier
         }
 
     plan_json = None
     retry_context = None
+    rate_limit_retries = 0
     retry_count = 0
     is_valid = False
 
+    # 3. Planning Loop
     while retry_count <= MAX_PLANNING_RETRIES:
-        plan_json = generate_plan(
-            user_goal=user_goal,
-            strategy_blueprint=strategy_blueprint.model_dump(),
-            gemini_client=gemini_client,
-            retry_context=retry_context,
-            tier=preferred_tier # Pass the selected tier
-        )
+        plan_json = generate_plan(user_goal, strategy_blueprint.model_dump(), gemini_client, retry_context, preferred_tier, existing_context_str)
         
         if plan_json == "RATE_LIMIT_HIT":
-            if preferred_tier == 'tier1':
-                # --- THIS IS THE NEW LOGIC ---
-                logger.warning("PLANNING ORCHESTRATOR: Tier 1 rate limit hit. Creating goal to ask user.")
-                # Return a "dummy" goal that can be re-planned later
-                return {
-                    "goal": user_goal,
-                    "plan": [], # Empty plan
-                    "status": "awaiting_tier_decision",
-                    "audit_critique": "Planning paused due to Tier 1 rate limit.",
-                    "strategy_blueprint": strategy_blueprint.model_dump(),
-                    "preferred_tier": 'tier1'
-                }
-                # --- END NEW LOGIC ---
-            else:
-                # You're on tier2, so just wait and retry (the original loop)
-                logger.warning(f"PLANNING ORCHESTRATOR: Rate limit hit on {preferred_tier}. Pausing for 30s...")
-                time.sleep(30)
-                continue # Try again without incrementing retry_count
+            rate_limit_retries += 1
+            time.sleep(30)
+            if rate_limit_retries > MAX_PLANNING_RETRIES: return None
+            continue
 
         if not plan_json:
-            logger.error(f"PLANNING ORCHESTRATOR: Planner failed to generate any plan (Attempt {retry_count + 1}).")
             retry_count += 1
-            retry_context = {"previous_invalid_plan": "None", "validation_error": "Planner returned an empty plan."}
-            time.sleep(5) 
+            retry_context = {"previous_invalid_plan": "None", "validation_error": "Planner returned empty/invalid JSON."}
+            if retry_count > MAX_PLANNING_RETRIES: break 
             continue
 
         is_valid, validation_error = validate_plan(plan_json)
         
-        if is_valid:
-            logger.info(f"PLANNING ORCHESTRATOR: Plan validated successfully (Attempt {retry_count + 1}).")
-            break
+        if is_valid: break
 
         retry_count += 1
-        if retry_count <= MAX_PLANNING_RETRIES:
-            logger.warning(f"PLANNING ORCHESTRATOR: Plan failed validation. Error: {validation_error}. Retrying ({retry_count}/{MAX_PLANNING_RETRIES})...")
-            retry_context = {"previous_invalid_plan": plan_json, "validation_error": validation_error}
-        else:
-            logger.error(f"PLANNING ORCHESTRATOR: Plan failed validation after {MAX_PLANNING_RETRIES + 1} attempts. Aborting.")
-            return None
+        retry_context = {"previous_invalid_plan": plan_json, "validation_error": validation_error}
 
     if is_valid:
+        # Ensure we return a clean list of dicts
+        clean_plan = [step.model_dump() if hasattr(step, 'model_dump') else step for step in Plan(plan=plan_json).plan]
         return {
             "goal": user_goal,
-            "plan": [{**step, "status": "pending", "output": None} for step in plan_json],
+            "plan": [{**step, "status": "pending", "output": None} for step in clean_plan],
             "audit_critique": f"Plan generated using '{strategy_blueprint.cognitive_gear}' gear.",
             "status": "pending",
             "strategy_blueprint": strategy_blueprint.model_dump(),
             "preferred_tier": preferred_tier
         }
-    else:
-        return None
+    
+    logger.error("PLANNING ORCHESTRATOR: Failed to generate a valid plan.")
+    return None
 
-def generate_plan(user_goal: str, strategy_blueprint: dict, gemini_client, retry_context: dict = None, tier: str = 'tier1') -> list | None | str:
-    """
-    Generates a detailed, step-by-step JSON plan using a manual schema.
-    Returns a plan list, None on failure, or "RATE_LIMIT_HIT" on rate limit.
-    """
-    retry_prompt_addition = ""
-    if retry_context:
-        logger.info("PLANNER: Attempting to regenerate plan based on validation feedback...")
-        retry_prompt_addition = f"""
-        **--- IMPORTANT: RETRY CONTEXT ---**
-        Your previous attempt failed validation with the error: "{retry_context.get('validation_error')}"
-        Here is the invalid plan you generated: {json.dumps(retry_context.get('previous_invalid_plan'), indent=2)}
-        You MUST generate a NEW, CORRECTED plan that fixes this specific issue.
-        **--- END RETRY CONTEXT ---**
-        """
-    else:
-        logger.info("PLANNER: Generating initial plan based on strategy blueprint...")
-
-    strategy_json_str = json.dumps(strategy_blueprint, indent=2)
-    tools_json_str = json.dumps(TOOL_MANIFEST, indent=2)
-    cognitive_gear = strategy_blueprint.get("cognitive_gear", "Direct_Response")
+def generate_plan(user_goal: str, strategy_blueprint: dict, gemini_client, retry_context: dict = None, tier: str = 'tier1', existing_context_str: str = None) -> list | None | str:
+    # Use response_mime_type="application/json" for JSON Mode.
+    planner_generation_config = {
+        "temperature": 0.1,
+        "response_mime_type": "application/json" 
+    }
+    
     current_date_str = datetime.now().strftime("%A, %B %d, %Y")
-    mandate = GEAR_MANDATES.get(cognitive_gear, GEAR_MANDATES["Direct_Response"])
+    
+    retry_str = ""
+    if retry_context:
+        retry_str = f"**RETRY CONTEXT:** Previous error: {retry_context.get('validation_error')}. Fix the plan structure."
 
+    context_str = ""
+    if existing_context_str:
+        context_str = f"**RE-PLANNING CONTEXT:**\n{existing_context_str}"
+        
+    heuristic_prompt_addition = ""
+    try:
+        heuristics = memory_manager.find_similar_memories(query_text=user_goal, n_results=3, where_filter={"type": "heuristic"})
+        if heuristics:
+            heuristics_str = "\n".join(f"- {h}" for h in heuristics)
+            heuristic_prompt_addition = f"**RELEVANT HEURISTICS:**\n{heuristics_str}"
+    except Exception: pass
+
+    user_profile_addition = ""
+    try:
+        profile = get_user_profile()
+        if profile:
+            profile_str = json.dumps(profile, indent=2)
+            user_profile_addition = f"**USER PROFILE:**\n{profile_str}"
+    except Exception: pass
+
+    system_instruction = AGENT_PROFILE_FOR_PLANNER
+    
     prompt = f"""
-    You are a "Strategic Plan Architect," a hyper-disciplined AI component in a larger agentic framework.
-    Your *only* task is to create a detailed, step-by-step JSON plan. You DO NOT execute the steps or write the final answer. You build the blueprint.
-    Your output MUST be only the plan's raw JSON.
-
-    {retry_prompt_addition}
-
-    **--- CRITICAL CONTEXT ---**
-    1.  **Your Role:** You are the Architect. You design the plan for other agents to execute.
-    2.  **The Executor:** A "Tactical" AI (the Executor) will refine all `prompt` steps.
-    3.  **The ReAct Agent:** A "Problem Solver" (the ReAct loop) will execute all `reactive_solve` tool calls.
-    4.  **The Swarm:** The system can execute steps in parallel.
-
-    **--- YOUR TASK ---**
-    Create a step-by-step plan based on the provided inputs.
+    {retry_str}
+    **TASK:** Create a JSON plan for: "{user_goal}"
+    **STRATEGY:** {json.dumps(strategy_blueprint, indent=2)}
+    **DATE:** {current_date_str}
     
-    **--- CRITICAL SCHEMA NOTE ---**
-    The 'parameters' field for any 'tool_call' MUST be a JSON-formatted STRING.
+    {context_str}
+    {heuristic_prompt_addition}
+    {user_profile_addition}
     
-    **FOR MOST TOOLS** (like `Google Search` or `finish`):
-    Example: "parameters": "{{\"query\": \"capital of Australia\"}}"
-
-    **EXCEPTION: `write_to_file` TOOL**
-    To avoid escaping errors, you MUST use this exact heredoc-style format.
-    The `content` must be a single JSON string, with newlines as `\\n`.
-    
-    Example:
-    "parameters": "{{\"filename\": \"report.md\", \"content\": \"Line 1 of the report.\\nLine 2 of the report.\\n- A bullet point\\n\"}}"
-    ---
-
-    **--- INPUTS ---**
-    **INPUT 1: The User's Original Goal:** "{user_goal}"
-    **INPUT 2: The Strategy Blueprint (Your Mandate):** {strategy_json_str}
-    **INPUT 3: Your Available Tools:** {tools_json_str}
-    **INPUT 4: Current Date:** "{current_date_str}"
-    
-    **YOUR MANDATE FOR THIS PLAN IS:**
-    **{mandate}**
-
-   **--- 4. PLANNER'S CORE DIRECTIVES (READ CAREFULLY) ---**
-
-    **1. AGENTIC BEHAVIOR:**
-        * **Temporal Awareness:** Your internal knowledge is outdated. It is currently {current_date_str}. You **MUST** use `Google Search` or `reactive_solve` for any query about "recent" events.
-        * **Confidence:** Act as a confident expert. Do **NOT** use `request_user_input` to ask for confirmation.
-
-    **2. TOOL SELECTION LOGIC (CRITICAL):**
-        * **Use `Google Search` (For Simple Facts):** Use this for simple, one-shot, factual lookups (e.g., "What is the capital of Australia?", "Find a quick list of 2025 SCC cases"). The Executor will automatically refine your query.
-        * **Use `reactive_solve` (For Deep Research & Complex Tasks):** Use this for *all* deep research, analysis, extraction, or multi-step tasks (e.g., "Research the *implications* of R. v. Morrison," "Analyze [output_of_step_1] and extract the case names").
-        * **Use `prompt` (For Synthesis):** Use this ONLY for *combining* the outputs of previous steps (e.g., "Write a blog post using [output_of_step_2]").
-        * **Use `write_to_file` (For Final Output):** This should be the *last* step of a plan.
-
-    **3. THE DECONSTRUCTION MANDATE (CRITICAL):**
-        * If a goal requires iterating over a list (e.g., "research all 5 cases"), you **MUST** create a "map/reduce" plan:
-            * **MAP:** Create a *separate*, parallel `reactive_solve` step for *each item*.
-            * **REDUCE:** Create a *final* `prompt` step that synthesizes all the parallel outputs.
-
-    **4. PLAN STRUCTURE:**
-        * **Dependencies:** If steps can run at the same time, they MUST have the same dependencies.
-        * **Placeholders:** Use `[output_of_step_X]` to reference outputs.
-    ---
-
-    **--- EXAMPLES OF EXPECTED OUTPUT ---**
-
-    **Example for `cognitive_gear: "Direct_Response"`:**
-    (Goal: "What is the capital of Australia?")
-    ```json
-    [
-      {{
-        "step_id": 1,
-        "dependencies": [],
-        "tool_call": {{
-          "tool_name": "google_search",
-          "parameters": {{
-            "query": "capital of Australia"
-          }}
-        }}
-      }}
-    ]
-    ```
-
-    **Example for `cognitive_gear: "Reflective_Synthesis"`:**
-    (Goal: "Write a blog post about the benefits of hydration.")
-    ```json
-    [
-      {{
-        "step_id": 1,
-        "dependencies": [],
-        "prompt": "Using google_search, research the top five scientifically-backed benefits of staying hydrated."
-      }},
-      {{
-        "step_id": 2,
-        "dependencies": [1],
-        "prompt": "Based on the research from [output_of_step_1], write a 300-word blog post titled 'The Clear Benefits of Hydration'. This is the first draft."
-      }},
-      {{
-        "step_id": 3,
-        "dependencies": [2],
-        "prompt": "Critically review the first draft from [output_of_step_2]. Check for clarity, engagement, and factual accuracy. Output your findings as a bulleted list of suggested improvements."
-      }},
-      {{
-        "step_id": 4,
-        "dependencies": [3],
-        "prompt": "Revise the blog post from [output_of_step_2] by incorporating the suggested improvements from [output_of_step_3] to create a final, polished version."
-      }}
-    ]
-    ```
-
-    **Example for `cognitive_gear: "Deep_Analysis"` (Using `reactive_solve`):**
-    (Goal: "Research the top 3 SCC cases from 2025 and write a summary report.")
-    ```json
-    [
-        {{
-          "step_id": 1,
-          "dependencies": [],
-          "tool_call": {{
-            "tool_name": "google_search",
-            "parameters": "{{\"query\": \"top Supreme Court of Canada cases 2025\"}}"
-          }}
-        }},
-        {{
-          "step_id": 2,
-          "dependencies": [1],
-          "tool_call": {{
-            "tool_name": "reactive_solve",
-            "parameters": "{{\"sub_goal\": \"From the search results in [output_of_step_1], identify the *first* most significant case. Then, conduct in-depth research on this single case and return a full summary.\"}}"
-          }}
-        }},
-        {{
-          "step_id": 3,
-          "dependencies": [1],
-          "tool_call": {{
-            "tool_name": "reactive_solve",
-            "parameters": "{{\"sub_goal\": \"From the search results in [output_of_step_1], identify the *second* most significant case. Then, conduct in-depth research on this single case and return a full summary.\"}}"
-          }}
-        }},
-        {{
-          "step_id": 4,
-          "dependencies": [1],
-          "tool_call": {{
-            "tool_name": "reactive_solve",
-            "parameters": "{{\"sub_goal\": \"From the search results in [output_of_step_1], identify the *third* most significant case. Then, conduct in-depth research on this single case and return a full summary.\"}}"
-          }}
-        }},
-        {{
-          "step_id": 5,
-          "dependencies": [2, 3, 4],
-          "prompt": "Act as a senior legal scholar. Synthesize the three detailed case summaries from [output_of_step_2], [output_of_step_3], and [output_of_step_4] into a single, comprehensive report. This is the first draft."
-        }},
-        {{
-          "step_id": 6,
-          "dependencies": [5],
-          "prompt": "Act as a skeptical legal editor. Perform a 'red-team' critique of the report from [output_of_step_5]. Check for logical inconsistencies, weak arguments, or missed analytical connections between the cases. Output a bulleted list of actionable improvements."
-        }},
-        {{
-          "step_id": 7,
-          "dependencies": [5, 6],
-          "prompt": "Act as the original legal scholar. Revise the first draft report from [output_of_step_5] by meticulously incorporating all the actionable improvements from the critique in [output_of_step_6]. Produce the final, polished version of the report."
-        }},
-        {{
-          "step_id": 8,
-          "dependencies": [7],
-          "tool_call": {{
-            "tool_name": "write_to_file",
-            "parameters": "{{\"filename\": \"SCC_Report_2025.md\", \"content\": \"[output_of_step_7]\"}}"
-          }}
-        }}
-    ]
-    ```
-
-    **--- FINAL INSTRUCTION ---**
-    Now, generate the JSON object for the plan. Your output MUST be only the JSON.
+    **FINAL INSTRUCTION:** Return ONLY the raw JSON object. 
+    The JSON must follow the structure: {{ "plan": [ ... steps ... ] }}
     """
     
-    response = gemini_client.ask_gemini(
-        prompt, 
-        tier=tier, 
-        response_schema=PLAN_SCHEMA
-    )
-    
-    if response == "RATE_LIMIT_HIT":
-        logger.warning("PLANNER: Rate limit hit during plan generation.")
-        return "RATE_LIMIT_HIT"
-    
-    if not response or not hasattr(response, 'text') or not response.text:
-        logger.error("PLANNER: Failed to get any response from the LLM.")
-        logger.debug(f"Raw response: {response}")
-        return None
-        
     try:
-        if not response or not hasattr(response, 'parsed') or not response.parsed:
-            logger.error("PLANNER: Failed to get a parsed plan from the LLM.")
-            logger.debug(f"Raw response text: {response.text if response else 'N/A'}")
-            return None
-
-        plan_data = response.parsed
-        logger.info(f"PLANNER: Successfully generated a plan with {len(plan_data.get('plan', []))} steps.")
-        return plan_data.get('plan')
+        response = gemini_client.ask_gemini(
+            prompt, tier=tier, generation_config=planner_generation_config,
+            # response_schema=None, 
+            system_instruction=system_instruction
+        )
+        
+        if response == "RATE_LIMIT_HIT": return "RATE_LIMIT_HIT"
+        
+        if response and response.text:
+            try:
+                parsed = json.loads(response.text)
+                
+                # --- CRITICAL FIX FOR 'list' object has no attribute 'get' ---
+                if isinstance(parsed, list):
+                    # The model returned the list directly (e.g. [step1, step2])
+                    return parsed
+                elif isinstance(parsed, dict):
+                    # The model returned the wrapper (e.g. {"plan": [step1, step2]})
+                    return parsed.get('plan', [])
+                else:
+                    logger.error(f"PLANNER: Unexpected JSON structure: {type(parsed)}")
+                    return None
+                    
+            except json.JSONDecodeError:
+                logger.error("PLANNER: Failed to decode JSON response.")
+                return None
+        
     except Exception as e:
-        logger.error(f"PLANNER: Error processing the parsed plan. Reason: {e}")
-        return None
+        logger.error(f"PLANNER GEN ERROR: {e}")
+        
+    return None

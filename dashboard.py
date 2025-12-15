@@ -1,12 +1,16 @@
 from flask import Flask, render_template, request, redirect, url_for, jsonify
 from flask_socketio import SocketIO
+import json
 import os
 import uuid
 import math
-import threading          
-from core.dmn import creative_synthesis_loop  
-from core.context import logger, status_update_queue, gemini_client, memory_manager  # <-- ADD 'gemini_client' and 'memory_manager'
+import threading
+import logging # Added for log level configuration
 from datetime import datetime
+
+# --- Imports from your original file ---
+from core.dmn import creative_synthesis_loop  
+from core.context import logger, status_update_queue, gemini_client, memory_manager, rate_limiter # Added rate_limiter
 from utils.database import (
     add_goal as db_add_goal, 
     get_active_goals, 
@@ -16,13 +20,26 @@ from utils.database import (
     archive_goal,
     update_goal_status,
     get_archived_goal_count,
-    update_goal_tier
+    update_goal_tier,
+    get_user_profile,
+    update_user_profile
 )
-from core.context import logger, status_update_queue
+# Use the new orchestrator_wake_event from context
+from core.context import orchestrator_wake_event
 from core.planner import orchestrate_planning
+from utils.goal_manager import create_and_add_goal
+from core.agent_profile import get_agent_profile
+from core.tools import TOOL_MANIFEST
+from google.genai import types
+
+# --- NOISE REDUCTION (Requested Change) ---
+# Disable the default Werkzeug logger to unclog the terminal
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR) 
 
 app = Flask(__name__)
-socketio = SocketIO(app, async_mode='threading')
+# Disable SocketIO logs
+socketio = SocketIO(app, async_mode='threading', logger=False, engineio_logger=False)
 ARCHIVE_PER_PAGE = 10
 
 def get_full_status_data():
@@ -33,7 +50,8 @@ def get_full_status_data():
     log_content = "Log file not found."
     try:
         with open('logs/agent.log', 'r', encoding='utf-8') as f:
-            log_lines = f.readlines()[-20:]
+            # Read last 50 lines for better context
+            log_lines = f.readlines()[-50:]
             log_content = "".join(reversed(log_lines))
     except Exception: pass
 
@@ -47,59 +65,95 @@ def get_full_status_data():
     except Exception: pass
 
     return {
-        'active_goals': active, 'archived_goals': archived_preview,
-        'log_tail': log_content, 'summary_content': summary_content
+        'active_goals': active, 
+        'archived_goals': archived_preview,
+        'log_tail': log_content, 
+        'summary_content': summary_content
     }
 
-def _create_and_add_goal(goal_text: str, source: str):
-    """
-    Orchestrates the full Strategist -> Planner pipeline for a given text goal.
-    This is the single source of truth for creating new goals.
-    """
-    logger.info(f"PLAN_ORCHESTRATOR: Starting new planning cycle for goal: '{goal_text}'")
-    
-    new_goal_obj = orchestrate_planning(goal_text)
-    
-    if new_goal_obj:
+# --- FLASK ROUTES ---
 
-        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-        new_goal_obj['goal_id'] = f"{source}_{'clarification' if new_goal_obj.get('status') == 'awaiting_input' else 'goal'}_{timestamp_str}"
-        
-        db_add_goal(new_goal_obj)
-        logger.info(f"Successfully created and added new goal '{new_goal_obj['goal_id']}' to database.")
-    else:
-        logger.error(f"Failed to create a plan for the goal: '{goal_text}'")
-        
-# --- Flask Routes ---
 @app.route('/')
-def home(): return render_template('index.html')
+def home(): 
+    return render_template('index.html')
 
 @app.route('/add_goal', methods=['POST'])
 def add_goal():
     """Handles goal submission from the main input form."""
     goal_text = request.form.get('goal_text')
     if goal_text:
-        _create_and_add_goal(goal_text, source="web")
+        create_and_add_goal(goal_text, source="web")
     return redirect(url_for('home'))
 
+# --- NEW: Tier Management Route ---
 @app.route('/api/goal/<goal_id>/set_tier', methods=['POST'])
-def set_goal_tier(goal_id):
-    """
-    API endpoint to downgrade a goal's tier and set it back to pending.
-    """
+def set_goal_tier_route(goal_id):
+    """API endpoint to change a goal's tier."""
     new_tier = request.json.get('tier', 'tier2')
-    
     try:
-        # 1. Update the goal's preferred tier in the database
         update_goal_tier(goal_id, new_tier)
+        # If it was paused due to rate limits, resume it
+        # But check current status first to avoid reviving cancelled goals
+        current_goal = get_goal_by_id(goal_id)
+        if current_goal and current_goal['status'] in ['paused', 'awaiting_tier_decision']:
+            update_goal_status(goal_id, 'pending')
         
-        # 2. Set the goal's status back to 'pending' so the orchestrator picks it up
-        update_goal_status(goal_id, 'pending')
-        
+        # Wake up orchestrator to process the change
+        orchestrator_wake_event.set()
         return jsonify(success=True)
     except Exception as e:
         logger.error(f"Error setting tier for goal {goal_id}: {e}")
         return jsonify(error=str(e)), 500
+
+# --- NEW: Status Management Route (Zombie Killer) ---
+@app.route('/api/goal/<goal_id>/set_status', methods=['POST'])
+def set_goal_status_route(goal_id):
+    """API endpoint to update the status of a goal."""
+    status = request.json.get('status')
+    if not status:
+        return jsonify(error="Status not provided"), 400
+    
+    if status == 'cancelled':
+        archive_goal(goal_id)
+        # We update status AFTER archiving to ensure the orchestrator loop sees it
+        # update_goal_status handles the DB logic
+        update_goal_status(goal_id, 'cancelled') 
+    else:
+        update_goal_status(goal_id, status)
+    
+    # Wake up orchestrator so it notices the cancellation immediately
+    orchestrator_wake_event.set()
+    return jsonify(success=True)
+
+# --- NEW: Manual DMN Trigger ---
+@app.route('/api/trigger_dmn', methods=['POST'])
+def trigger_dmn():
+    """API endpoint to manually trigger the DMN."""
+    logger.info("DASHBOARD: Manual DMN trigger received.")
+    
+    def dmn_task():
+        with app.app_context():
+            creative_synthesis_loop(gemini_client, memory_manager)
+            status_update_queue.put("goal_updated")
+            orchestrator_wake_event.set()
+
+    threading.Thread(target=dmn_task, daemon=True).start()
+    return jsonify(success=True, message="DMN brainstorming started in background.")
+
+# --- NEW: Rate Limit API ---
+@app.route('/api/rate_limits', methods=['GET'])
+def get_rate_limits():
+    """Returns current usage stats for the dashboard."""
+    try:
+        t1_usage = rate_limiter.get_daily_usage_percentage('tier1')
+        t2_usage = rate_limiter.get_daily_usage_percentage('tier2')
+        
+        return jsonify({
+            "tier1": {"usage_pct": t1_usage, "limit": 50},
+            "tier2": {"usage_pct": t2_usage, "limit": 250}
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/provide_input', methods=['POST'])
 def provide_input():
@@ -110,59 +164,16 @@ def provide_input():
     original_goal = get_goal_by_id(goal_id)
     
     if original_goal and user_response:
-        # First, mark the old goal as complete
         original_goal['status'] = 'complete'
         update_goal(original_goal)
-        # Then, archive it
         archive_goal(goal_id)
         
-        # Create a new, refined goal to send back through the full pipeline
         refined_goal_text = f"Original Goal: '{original_goal['goal']}'. User Clarification: '{user_response}'"
-        
-        # Calls the *same* helper function
-        _create_and_add_goal(refined_goal_text, source="clarification")
+        create_and_add_goal(refined_goal_text, source="clarification") 
     else:
         logger.error(f"Could not find goal '{goal_id}' or user response was empty.")
         
     return redirect(url_for('home'))
-
-@app.route('/api/goal/<goal_id>/set_status', methods=['POST'])
-def set_goal_status(goal_id):
-    """API endpoint to update the status of a goal."""
-    status = request.json.get('status')
-    if not status:
-        return jsonify(error="Status not provided"), 400
-    
-    if status == 'cancelled':
-        archive_goal(goal_id)
-        update_goal_status(goal_id, 'cancelled') 
-    else:
-        update_goal_status(goal_id, status)
-    
-    return jsonify(success=True)
-
-@app.route('/api/trigger_dmn', methods=['POST'])
-def trigger_dmn():
-    """
-    API endpoint to manually trigger the DMN's creative_synthesis_loop
-    in a background thread.
-    """
-    logger.info("DASHBOARD: Manual DMN trigger received.")
-    
-    def dmn_task():
-        logger.info("DMN_THREAD: Starting creative synthesis loop...")
-        with app.app_context():
-            creative_synthesis_loop(gemini_client, memory_manager)
-            # After the DMN runs and (potentially) adds a goal,
-            # we ring the bell to force the dashboard to update.
-            status_update_queue.put("goal_updated")
-            logger.info("DMN_THREAD: Creative synthesis loop finished.")
-
-    # Run the DMN in a background thread so the API request
-    # returns immediately and doesn't time out.
-    threading.Thread(target=dmn_task, daemon=True).start()
-    
-    return jsonify(success=True, message="DMN brainstorming started in background.")
 
 @app.route('/archive')
 def view_archive():
@@ -184,7 +195,6 @@ def full_log_viewer():
             log_content = "".join(log_lines).replace('\n', '<br>')
     except Exception: pass
     return render_template('logs.html', log_content=log_content, search_query=search_query)
-
 
 @app.route('/summaries')
 def summary_archive():
@@ -209,7 +219,7 @@ def view_single_summary(filename):
 
 @socketio.on('connect')
 def handle_connect():
-    logger.info("Dashboard client connected via WebSocket.")
+    # Removed logger.info call to reduce noise
     socketio.emit('status_update', get_full_status_data())
 
 def watch_status_queue():
@@ -219,7 +229,101 @@ def watch_status_queue():
         message = status_update_queue.get()
         with app.app_context():
             if message == "goal_updated":
-                logger.info("Received 'goal_updated' signal. Pushing full status update.")
                 socketio.emit('status_update', get_full_status_data())
             else: 
                 socketio.emit('new_log_line', {'data': message})
+
+def get_chat_context():
+    """Gathers all context for the chat agent."""
+    profile = get_user_profile()
+    profile_str = json.dumps(profile, indent=2) if profile else "No profile data exists yet."
+    recent_tasks = get_archived_goals(page=1, per_page=3)
+    tasks_str = "\n".join([f"- {g['goal']} (Status: {g['status']})" for g in recent_tasks]) if recent_tasks else "No recent tasks."
+    agent_profile = get_agent_profile(for_planner=False)
+    return profile_str, tasks_str, agent_profile
+
+def get_chat_tools() -> list[types.Tool]:
+    """Builds the list of tools the chat agent can use."""
+    chat_tool_list = []
+    for tool_def in TOOL_MANIFEST:
+        if tool_def['tool_name'] == 'update_user_profile':
+            func = types.FunctionDeclaration(
+                name=tool_def['tool_name'],
+                description=tool_def['description'],
+            )
+            schema_properties = {}
+            required_params = []
+            for param in tool_def.get('parameters', []):
+                param_name = param['name']
+                type_mapping = {"string": "STRING"}
+                schema_properties[param_name] = types.Schema(
+                    type=type_mapping.get(param['type'], "STRING"),
+                    description=param.get('description')
+                )
+                required_params.append(param_name)
+            func.parameters = types.Schema(
+                type="OBJECT",
+                properties=schema_properties,
+                required=required_params
+            )
+            chat_tool_list.append(types.Tool(function_declarations=[func]))
+    return chat_tool_list
+
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    """
+    Handles a single turn of a text-based chat conversation.
+    """
+    data = request.json
+    user_message = data.get('message')
+    chat_history = data.get('history', [])
+
+    if not user_message: return jsonify(error="No message provided"), 400
+
+    try:
+        profile_str, tasks_str, agent_profile = get_chat_context()
+        
+        system_instruction = f"""
+        You are Cognito, a proactive AI partner. Your primary goal right now is to have a natural, friendly conversation.
+        **--- CONTEXT: YOUR AGENT PROFILE ---** {agent_profile}
+        **--- CONTEXT: USER PROFILE ---** {profile_str}
+        **--- CONTEXT: RECENT TASKS ---** {tasks_str}
+        """
+        
+        chat_tools = get_chat_tools()
+        api_history = []
+        for turn in chat_history:
+            api_history.append(types.Content(role=turn['role'], parts=[types.Part(text=turn['message'])]))
+        api_history.append(types.Content(role="user", parts=[types.Part(text=user_message)]))
+        
+        response = gemini_client.ask_gemini(
+            prompt=api_history, 
+            tier='tier1', 
+            generation_config={"temperature": 0.7}, 
+            tools=chat_tools, 
+            system_instruction=system_instruction
+        )
+        
+        if not response: return jsonify(error="API call failed"), 500
+
+        response_part = response.candidates[0].content.parts[0]
+        
+        if response_part.function_call:
+            fc = response_part.function_call
+            if fc.name == 'update_user_profile':
+                update_user_profile(fc.args.get('key'), fc.args.get('value'), "live_chat")
+                api_history.append(response.candidates[0].content)
+                api_history.append(types.Content(role="function", parts=[types.Part(function_response=types.FunctionResponse(name="update_user_profile", response={"status": "success"}))]))
+                
+                response = gemini_client.ask_gemini(prompt=api_history, tier='tier1', generation_config={"temperature": 0.7}, tools=chat_tools, system_instruction=system_instruction)
+                if not response: return jsonify(error="API call failed after tool use"), 500
+                return jsonify(reply=response.text)
+        
+        if response.text:
+            return jsonify(reply=response.text)
+        else:
+            return jsonify(reply="[No text response generated]")
+
+    except Exception as e:
+        logger.error(f"Error in /api/chat: {e}", exc_info=True)
+        return jsonify(error=str(e)), 500

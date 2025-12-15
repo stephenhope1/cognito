@@ -20,7 +20,7 @@
         .goal.status-complete, .goal.status-cancelled { border-left-color: #03dac6; }
         .goal.status-in-progress { border-left-color: #f0e68c; }
         .goal.status-failed { border-left-color: #cf6679; }
-        .goal.status-awaiting-input, .goal.status-paused, .goal.status-awaiting-tier-decision { border-left-color: #3b82f6; } /* Added new status */
+        .goal.status-awaiting-input, .goal.status-paused, .goal.status-awaiting-tier-decision, .goal.status-awaiting-replan { border-left-color: #3b82f6; }
         h3 { margin-top: 0; cursor: pointer; }
         .details { margin-top: 1.5em; padding-left: 1.5em; border-left: 1px solid #444; }
         .step { margin-bottom: 1.5em; }
@@ -28,16 +28,66 @@
         .add-goal-form input, .user-input-form textarea { width: 100%; padding: 1em; border-radius: 4px; border: 1px solid #333; background-color: #222; color: #eee; font-size: 1em; }
         .add-goal-form button, .user-input-form button, .goal-actions button { padding: 1em 1.5em; border-radius: 4px; border: none; background-color: #bb86fc; color: #121212; font-size: 1em; font-weight: bold; cursor: pointer; }
         .user-input-form { margin-top: 1em; }
-        .goal-actions { margin-top: 1em; display: flex; gap: 0.5em; }
+        .goal-actions { margin-top: 1em; display: flex; gap: 0.5em; flex-wrap: wrap; }
         .goal-actions button { font-size: 0.8em; padding: 0.5em 1em; background-color: #373737; color: #eee; }
         .goal-actions button.cancel { background-color: #cf6679; color: #121212; }
         .goal-status-message { font-style: italic; color: #f0e68c; margin-bottom: 0.5em; }
+        
+        /* Rate Limit Styles */
+        .rate-limit-container {
+            background: #1e1e1e; /* Match dark theme */
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            display: flex;
+            gap: 20px;
+            border: 1px solid #333;
+        }
+        .rate-bar-group { flex: 1; }
+        .rate-bar-bg { background: #333; height: 10px; border-radius: 5px; overflow: hidden; margin-top: 5px; }
+        .rate-bar-fill { height: 100%; width: 0%; transition: width 0.5s ease-in-out; }
+        #t1-bar { background: #ffd700; } /* Gold for Tier 1 */
+        #t2-bar { background: #03dac6; } /* Teal for Tier 2 */
+
+        /* Tier Badge Styles */
+        .tier-badge {
+            padding: 2px 6px; border-radius: 4px; font-size: 0.8em; font-weight: bold;
+            margin-left: 5px; display: inline-block; vertical-align: middle;
+        }
+        .tier-tier1 { background: #ffd700; color: #000; }
+        .tier-tier2 { background: #03dac6; color: #000; }
+        .tier-controls {
+            display: flex; align-items: center; gap: 5px; 
+            margin-top: 10px; padding-top: 10px; border-top: 1px solid #333;
+        }
+        .tier-btn {
+            font-size: 0.7em; padding: 2px 8px; background-color: #333; color: #bbb; border: 1px solid #444; border-radius: 3px; cursor: pointer;
+        }
+        .tier-btn:hover { background-color: #444; color: white; }
+        .tier-btn.active { background-color: #bb86fc; color: black; border-color: #bb86fc; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Cognito Agent Dashboard</h1>
         
+        <div class="rate-limit-container">
+            <div class="rate-bar-group">
+                <div style="display:flex; justify-content:space-between;">
+                    <span><strong>Tier 1 (Pro)</strong></span>
+                    <span id="t1-text">Loading...</span>
+                </div>
+                <div class="rate-bar-bg"><div id="t1-bar" class="rate-bar-fill"></div></div>
+            </div>
+            <div class="rate-bar-group">
+                <div style="display:flex; justify-content:space-between;">
+                    <span><strong>Tier 2 (Flash)</strong></span>
+                    <span id="t2-text">Loading...</span>
+                </div>
+                <div class="rate-bar-bg"><div id="t2-bar" class="rate-bar-fill"></div></div>
+            </div>
+        </div>
+
         <div class="add-goal-form">
             <form action="/add_goal" method="post" style="width: 100%; display: flex; gap: 1em;">
                 <input type="text" name="goal_text" placeholder="Enter a new high-level goal..." required>
@@ -90,7 +140,6 @@
             }
         }
 
-        // --- NEW FUNCTION ADDED ---
         async function setTier(goalId, newTier) {
             try {
                 await fetch(`/api/goal/${goalId}/set_tier`, {
@@ -98,13 +147,12 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ tier: newTier })
                 });
+                // The socket update will refresh the UI, no need to manual DOM manip
             } catch (error) {
                 console.error('Error setting goal tier:', error);
             }
         }
         
-        // --- END NEW FUNCTION ---
-        // --- NEW FUNCTION ADDED ---
         async function triggerDMN() {
             const button = document.getElementById('dmn-trigger-button');
             const statusText = document.getElementById('dmn-status-text');
@@ -116,14 +164,11 @@
             
             try {
                 await fetch('/api/trigger_dmn', { method: 'POST' });
-                // The backend will trigger a 'status_update' when the
-                // DMN is done, so we don't need to do anything else.
-                // We'll just reset the button after a short delay.
                 setTimeout(() => {
                     button.disabled = false;
                     button.textContent = "Brainstorm New Goal";
                     statusText.style.display = 'none';
-                }, 2000); // Reset button after 2 seconds
+                }, 2000);
             } catch (error) {
                 console.error('Error triggering DMN:', error);
                 button.disabled = false;
@@ -131,31 +176,29 @@
                 statusText.textContent = "An error occurred.";
             }
         }
-        // --- END NEW FUNCTION ---
 
         function renderStep(step, goalId, goalStatus) {
             let stepHtml = `<strong>Step ${step.step_id || 'N/A'} (${step.status}):</strong>`;
             
-            // --- NEW: Add refined_prompt logic for BOTH tool_call and prompt ---
             if (step.refined_prompt) {
-                stepHtml += `<p>Refined Executor Prompt:</p><pre>${step.refined_prompt}</pre>`;
+                let title = (step.tool_call && step.tool_call.tool_name === 'google_search') ? 'Refined Search Query' : 'Refined Executor Prompt';
+                if (step.tool_call && step.tool_call.tool_name === 'reactive_solve') {
+                    title = 'Refined ReAct Sub-Goal';
+                }
+                stepHtml += `<p style="color:#aaa; font-size:0.9em; margin: 5px 0;">${title}:</p><pre>${step.refined_prompt}</pre>`;
             }
-            // --- END NEW ---
 
             if (step.tool_call) {
-                // Add a check to avoid showing the original prompt if it's already been refined
-                if (!step.refined_prompt) {
-                     stepHtml += `<p>Tool: <code>${step.tool_call.tool_name || 'Unknown Tool'}</code></p>`;
+                if (!step.refined_prompt || (step.tool_call.tool_name !== 'google_search' && step.tool_call.tool_name !== 'reactive_solve')) {
+                    stepHtml += `<p>Tool: <code>${step.tool_call.tool_name || 'Unknown Tool'}</code></p>`;
+                    let paramsText = step.tool_call.parameters;
+                    if (typeof paramsText === 'string') {
+                        try { paramsText = JSON.stringify(JSON.parse(paramsText), null, 2); } catch (e) {}
+                    } else if (typeof paramsText === 'object') {
+                        paramsText = JSON.stringify(paramsText, null, 2);
+                    }
+                    stepHtml += `<p>Parameters: <pre>${paramsText || '{}'}</pre></p>`;
                 }
-                let paramsText = step.tool_call.parameters;
-                if (typeof paramsText === 'string') {
-                    try {
-                        paramsText = JSON.stringify(JSON.parse(paramsText), null, 2);
-                    } catch (e) { /* leave as is */ }
-                } else if (typeof paramsText === 'object') {
-                    paramsText = JSON.stringify(paramsText, null, 2);
-                }
-                stepHtml += `<p>Parameters: <pre>${paramsText || '{}'}</pre></p>`;
 
                 if (goalStatus === 'awaiting_input' && step.status === 'pending' && step.tool_call.tool_name === 'request_user_input') {
                     stepHtml += `
@@ -170,10 +213,9 @@
                     `;
                 }
             } else if (step.prompt) {
-                stepHtml += `<p>Prompt:</p><pre>${step.prompt}</pre>`;
-                if (step.refined_prompt && step.refined_prompt !== step.prompt) {
-                    stepHtml += `<p>Refined Executor Prompt:</p><pre>${step.refined_prompt}</pre>`;
-                }    
+                if (!step.refined_prompt) {
+                    stepHtml += `<p>Original Prompt:</p><pre>${step.prompt}</pre>`;
+                }
             } else {
                 stepHtml += `<p>Invalid Step Format:</p><pre>${JSON.stringify(step, null, 2)}</pre>`;
             }
@@ -200,22 +242,28 @@
                 `;
             }
 
-            // --- LOGIC MODIFIED ---
             let actionsHtml = '';
+            
+            // --- Tier Switching Logic ---
             if (is_active) {
-                actionsHtml += '<div class="goal-actions">';
+                let currentTier = goal.preferred_tier || 'tier1';
+                actionsHtml += `
+                    <div class="tier-controls">
+                        <span style="font-size: 0.85em; color: #ccc;">Priority:</span>
+                        <button class="tier-btn ${currentTier === 'tier1' ? 'active' : ''}" onclick="setTier('${goal.goal_id}', 'tier1')">Tier 1 (Pro)</button>
+                        <button class="tier-btn ${currentTier === 'tier2' ? 'active' : ''}" onclick="setTier('${goal.goal_id}', 'tier2')">Tier 2 (Flash)</button>
+                        <span class="tier-badge tier-${currentTier}">${currentTier.toUpperCase()}</span>
+                    </div>
+                    <div class="goal-actions" style="margin-top:10px;">
+                `;
                 
                 if (goal.status === 'awaiting_tier_decision') {
                     actionsHtml += `
-                        <div class="goal-status-message">
-                            Tier 1 limit reached. What would you like to do?
+                        <div class="goal-status-message" style="width:100%">
+                            Tier 1 limit reached. Paused.
                         </div>
-                        <button onclick="setGoalStatus('${goal.goal_id}', 'pending')">
-                            Wait for Reset
-                        </button>
-                        <button onclick="setTier('${goal.goal_id}', 'tier2')">
-                            Downgrade to Tier 2
-                        </button>
+                        <button onclick="setGoalStatus('${goal.goal_id}', 'pending')">Wait for Reset</button>
+                        <button onclick="setTier('${goal.goal_id}', 'tier2')">Switch to Tier 2</button>
                     `;
                 } else if (goal.status === 'in-progress' || goal.status === 'pending') {
                     actionsHtml += `<button onclick="setGoalStatus('${goal.goal_id}', 'paused')">Pause</button>`;
@@ -223,11 +271,9 @@
                     actionsHtml += `<button onclick="setGoalStatus('${goal.goal_id}', 'pending')">Resume</button>`;
                 }
                 
-                // Cancel button is always shown for active goals
                 actionsHtml += `<button class="cancel" onclick="setGoalStatus('${goal.goal_id}', 'cancelled')">Cancel</button>`;
                 actionsHtml += '</div>';
             }
-            // --- END MODIFIED LOGIC ---
 
             return `
                 <div class="goal status-${goal.status}" id="goal-${goal.goal_id}">
@@ -252,7 +298,7 @@
                 data.active_goals.forEach(goal => activeHtml += renderGoal(goal, true));
             } else { activeHtml += '<div class="goal"><p>No active goals.</p></div>'; }
 
-            let archivedHtml = '<h2><a href="/archive" target="_blank">Archived Goals (Preview)</a></h2>';
+            let archivedHtml = '<h2><a href="/archive" target="_blank" style="color: #bb86fc; text-decoration: none;">Archived Goals (Preview)</a></h2>';
             if (data.archived_goals && data.archived_goals.length > 0) {
                 data.archived_goals.forEach(goal => archivedHtml += renderGoal(goal, false));
             } else { archivedHtml += '<div class="goal"><p>No archived goals found.</p></div>'; }
@@ -272,12 +318,34 @@
             const logContainer = document.getElementById('log-content');
             const MAX_LOG_LINES = 20;
 
+            // Rate Limit Updater
+            function updateRateLimits() {
+                fetch('/api/rate_limits')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.tier1) {
+                            document.getElementById('t1-bar').style.width = Math.min(data.tier1.usage_pct, 100) + '%';
+                            document.getElementById('t1-text').innerText = Math.round(data.tier1.usage_pct) + '%';
+                        }
+                        if (data.tier2) {
+                            document.getElementById('t2-bar').style.width = Math.min(data.tier2.usage_pct, 100) + '%';
+                            document.getElementById('t2-text').innerText = Math.round(data.tier2.usage_pct) + '%';
+                        }
+                    })
+                    .catch(err => console.error("Rate limit fetch error:", err));
+            }
+            
+            // Update rate limits immediately and then every 5 seconds
+            updateRateLimits();
+            setInterval(updateRateLimits, 5000);
+
             socket.on('connect', () => { console.log('Connected to agent via WebSocket!'); });
             socket.on('disconnect', () => { console.log('Disconnected from agent.'); });
 
             socket.on('status_update', (data) => {
-                console.log('Received full status update from agent.');
+                // console.log('Received full status update from agent.'); // Optional logging
                 updateFullDashboard(data);
+                updateRateLimits(); // Also refresh limits when status changes
             });
 
             socket.on('new_log_line', (msg) => {

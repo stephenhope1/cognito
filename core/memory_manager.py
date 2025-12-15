@@ -49,28 +49,33 @@ class MemoryManager:
         except Exception as e:
             logger.error(f"ERROR: Failed to add memory '{doc_id}': {e}")
 
-    def find_similar_memories(self, query_text: str, n_results: int = 3) -> list:
+    def find_similar_memories(self, query_text: str, n_results: int = 3, where_filter: dict = None) -> list:
         """
-        Finds memories in the collection that are similar to the query text.
+        Finds memories in the collection that are similar to the query text,
+        with an optional metadata filter.
 
         Args:
             query_text (str): The text to search for.
             n_results (int): The number of similar memories to return.
+            where_filter (dict, optional): A filter to apply to the metadata.
 
         Returns:
             list: A list of the most similar documents found.
         """
         try:
+            # We use a default empty dict if the filter is None
+            if where_filter is None:
+                where_filter = {}
+
             results = self.collection.query(
                 query_texts=[query_text],
-                n_results=n_results
+                n_results=n_results,
+                where=where_filter  # <-- This is the new, powerful addition
             )
             return results.get('documents', [[]])[0]
         except Exception as e:
-            logger.error(f"ERROR: Failed to query memories: {e}")
+            logger.error(f"ERROR: Failed to query memories with filter {where_filter}: {e}")
             return []
-
-            # Add this code to the VERY END of your memory_manager.py file
 
 if __name__ == '__main__':
     logger.info("\n--- Testing MemoryManager ---")
